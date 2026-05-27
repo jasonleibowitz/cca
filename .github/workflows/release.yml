@@ -1,0 +1,113 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump_type:
+        description: 'Semver bump'
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout cca
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute next version
+        id: ver
+        run: |
+          set -euo pipefail
+          CURRENT=$(grep -E '^VERSION="[0-9]+\.[0-9]+\.[0-9]+"' cca | head -1 | sed -E 's/.*"([0-9]+\.[0-9]+\.[0-9]+)".*/\1/')
+          if [ -z "$CURRENT" ]; then
+            echo "::error::Could not parse VERSION from cca script"
+            exit 1
+          fi
+          IFS=. read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          case "${{ inputs.bump_type }}" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+          NEXT="${MAJOR}.${MINOR}.${PATCH}"
+          if git rev-parse "v${NEXT}" >/dev/null 2>&1; then
+            echo "::error::Tag v${NEXT} already exists"
+            exit 1
+          fi
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "next=$NEXT" >> "$GITHUB_OUTPUT"
+          echo "Bumping ${CURRENT} → ${NEXT}"
+
+      - name: Bump VERSION, commit, tag, push
+        run: |
+          set -euo pipefail
+          NEXT="${{ steps.ver.outputs.next }}"
+          sed -i -E 's|^VERSION="[0-9]+\.[0-9]+\.[0-9]+"|VERSION="'"$NEXT"'"|' cca
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add cca
+          git commit -m "release: v${NEXT}"
+          git tag "v${NEXT}"
+          git push origin HEAD:main
+          git push origin "v${NEXT}"
+
+      - name: Fetch tarball and compute SHA256
+        id: tar
+        run: |
+          set -euo pipefail
+          NEXT="${{ steps.ver.outputs.next }}"
+          URL="https://github.com/${{ github.repository }}/archive/refs/tags/v${NEXT}.tar.gz"
+          for i in 1 2 3 4 5 6; do
+            if curl -sLfo cca.tar.gz "$URL"; then
+              break
+            fi
+            echo "Tarball not ready yet (attempt $i), sleeping…"
+            sleep $((i * 5))
+          done
+          [ -s cca.tar.gz ] || { echo "::error::Failed to fetch $URL"; exit 1; }
+          SHA=$(sha256sum cca.tar.gz | awk '{print $1}')
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: jasonleibowitz/homebrew-tap
+          token: ${{ secrets.TAP_TOKEN }}
+          path: tap
+
+      - name: Update formula and push
+        run: |
+          set -euo pipefail
+          NEXT="${{ steps.ver.outputs.next }}"
+          SHA="${{ steps.tar.outputs.sha }}"
+          cd tap
+          sed -i -E "s|archive/refs/tags/v[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz|archive/refs/tags/v${NEXT}.tar.gz|" Formula/cca.rb
+          sed -i -E "s|sha256 \"[a-f0-9]{64}\"|sha256 \"${SHA}\"|" Formula/cca.rb
+          sed -i -E "s|cca [0-9]+\.[0-9]+\.[0-9]+|cca ${NEXT}|" Formula/cca.rb
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/cca.rb
+          git commit -m "cca ${NEXT}"
+          git push
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NEXT="${{ steps.ver.outputs.next }}"
+          gh release create "v${NEXT}" --title "v${NEXT}" --generate-notes
