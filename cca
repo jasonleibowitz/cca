@@ -1,0 +1,727 @@
+#!/usr/bin/env bash
+# cca — Claude Code Accounts: manage multiple Claude Code (CLI) subscriptions
+# side by side. Auth isolation uses CLAUDE_CODE_OAUTH_TOKEN (per Anthropic's
+# documented auth precedence), which works on macOS, Linux, and Windows
+# regardless of where the Keychain entry lives.
+#
+# Scope: Claude Code CLI only. Claude Desktop / Cowork is a separate problem.
+# https://github.com/<owner>/cca
+set -euo pipefail
+
+VERSION="0.1.0"
+
+CLAUDE_HOME="${HOME}/.claude"
+PROFILE_PREFIX="${HOME}/.claude-"
+
+# Items in ~/.claude/ shared across profiles (symlinked into each
+# ~/.claude-<name>/). Auth and per-session state are intentionally excluded.
+SHARED_ITEMS=(
+  CLAUDE.md
+  agents
+  carta
+  commands
+  hooks
+  keybindings.json
+  mcp.json
+  plugins
+  rules
+  settings.json
+  skills
+  statusline.sh
+)
+
+# Per-profile state lives in ~/.claude-<name>/ and is never touched by cca
+# after `add`/`refresh`. The token file is the one cca writes:
+TOKEN_FILE_NAME=".cca-token"
+PROFILE_MARKER_NAME=".cca-profile"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+_die()  { printf 'cca: %s\n' "$*" >&2; exit 1; }
+_warn() { printf 'cca: %s\n' "$*" >&2; }
+_info() { printf '%s\n' "$*" >&2; }
+
+# Terminal styling. Empty strings when stderr isn't a TTY, NO_COLOR is set,
+# or tput is unavailable — so output stays clean in pipelines.
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ] && command -v tput >/dev/null 2>&1; then
+  BOLD="$(tput bold 2>/dev/null || true)"
+  DIM="$(tput dim 2>/dev/null || true)"
+  CYAN="$(tput setaf 6 2>/dev/null || true)"
+  YELLOW="$(tput setaf 3 2>/dev/null || true)"
+  GREEN="$(tput setaf 2 2>/dev/null || true)"
+  RESET="$(tput sgr0 2>/dev/null || true)"
+else
+  BOLD=''; DIM=''; CYAN=''; YELLOW=''; GREEN=''; RESET=''
+fi
+
+# Resolve <name> → absolute profile dir. "main" / "default" → ~/.claude.
+_profile_dir() {
+  local name="$1"
+  if [ "$name" = "main" ] || [ "$name" = "default" ]; then
+    printf '%s' "$CLAUDE_HOME"
+  else
+    printf '%s%s' "$PROFILE_PREFIX" "$name"
+  fi
+}
+
+# Inverse: absolute dir → display name. Returns "main" for ~/.claude.
+_profile_name_of_dir() {
+  local d="${1%/}"
+  if [ "$d" = "$CLAUDE_HOME" ]; then
+    printf 'main'
+  else
+    printf '%s' "${d#$PROFILE_PREFIX}"
+  fi
+}
+
+# Currently-active profile resolution.
+# Priority: CLAUDE_CODE_OAUTH_TOKEN (if matches a known profile's token) →
+# CLAUDE_CONFIG_DIR → main.
+_active_dir() {
+  if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+    printf '%s' "$CLAUDE_CONFIG_DIR"
+  else
+    printf '%s' "$CLAUDE_HOME"
+  fi
+}
+
+# List cca-managed profile dirs, one per line. Always lists main first.
+_list_profile_dirs() {
+  printf '%s\n' "$CLAUDE_HOME"
+  # shellcheck disable=SC2231
+  for d in ${PROFILE_PREFIX}*; do
+    [ -d "$d" ] || continue
+    [ -f "$d/$PROFILE_MARKER_NAME" ] || continue
+    printf '%s\n' "$d"
+  done
+}
+
+# Returns 0 if profile has a stored token, 1 otherwise.
+_has_token() {
+  local dir="$1"
+  [ -f "$dir/$TOKEN_FILE_NAME" ]
+}
+
+# Print stored token (or empty) for a profile dir.
+_read_token() {
+  local dir="$1"
+  [ -f "$dir/$TOKEN_FILE_NAME" ] || return 0
+  cat "$dir/$TOKEN_FILE_NAME"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# commands
+# ─────────────────────────────────────────────────────────────────────────────
+
+_picker() {
+  # Requires interactive TTY on stdin + stderr (UI goes to stderr so callers
+  # can capture the selection via stdout).
+  if [ ! -t 0 ] || [ ! -t 2 ]; then
+    return 1
+  fi
+
+  local profiles=() dir
+  while read -r dir; do
+    [ -d "$dir" ] || continue
+    profiles+=("$(_profile_name_of_dir "$dir")")
+  done < <(_list_profile_dirs)
+
+  local n=${#profiles[@]}
+  if [ "$n" -le 1 ]; then
+    _warn "only the main profile exists. Run 'cca add <name>' to create another."
+    return 1
+  fi
+
+  local active sel=0 i
+  active="$(_profile_name_of_dir "$(_active_dir)")"
+  for i in "${!profiles[@]}"; do
+    if [ "${profiles[$i]}" = "$active" ]; then sel=$i; break; fi
+  done
+
+  # Hide cursor + restore on any exit path.
+  tput civis >&2 2>/dev/null || true
+  local _restored=0
+  _picker_cleanup() {
+    [ "$_restored" -eq 1 ] && return
+    _restored=1
+    tput cnorm >&2 2>/dev/null || true
+  }
+  trap _picker_cleanup EXIT INT TERM
+
+  # Reserve vertical space: one line per profile + one hint line.
+  local total=$((n + 1))
+  for ((i=0; i<total; i++)); do printf '\n' >&2; done
+
+  while true; do
+    # Move cursor back to the top of our widget.
+    tput cuu "$total" >&2
+
+    for i in "${!profiles[@]}"; do
+      tput el >&2
+      local cur_marker=''
+      [ "${profiles[$i]}" = "$active" ] && cur_marker=" ${DIM}(current)${RESET}"
+      if [ "$i" -eq "$sel" ]; then
+        printf '%s❯%s %s%s%s%s\n' "$CYAN" "$RESET" "$BOLD" "${profiles[$i]}" "$RESET" "$cur_marker" >&2
+      else
+        printf '  %s%s\n' "${profiles[$i]}" "$cur_marker" >&2
+      fi
+    done
+    tput el >&2
+    printf '%s↑/↓ navigate · enter to select · esc / q to cancel%s\n' "$DIM" "$RESET" >&2
+
+    local k r1='' r2=''
+    IFS= read -rsn1 k
+    case "$k" in
+      $'\033')
+        # Escape sequence (arrow key) or plain ESC. macOS ships bash 3.2 which
+        # doesn't support fractional -t, so read one byte at a time with a
+        # 1-second timeout — long enough for terminals that send the sequence
+        # in multiple chunks, short enough to feel responsive when plain ESC
+        # is what the user actually pressed.
+        IFS= read -rsn1 -t 1 r1 2>/dev/null || r1=''
+        if [ "$r1" = "[" ]; then
+          IFS= read -rsn1 -t 1 r2 2>/dev/null || r2=''
+          case "$r2" in
+            A) sel=$(( (sel + n - 1) % n )) ;;  # up
+            B) sel=$(( (sel + 1) % n )) ;;       # down
+            *) : ;;                              # ignore other arrows/keys
+          esac
+        else
+          # plain ESC — cancel
+          _picker_cleanup; trap - EXIT INT TERM; return 1
+        fi
+        ;;
+      '')
+        # Enter: clear the hint line, restore cursor, emit selection on stdout.
+        tput el >&2
+        _picker_cleanup
+        trap - EXIT INT TERM
+        printf '%s' "${profiles[$sel]}"
+        return 0
+        ;;
+      q|Q)
+        _picker_cleanup
+        trap - EXIT INT TERM
+        return 1
+        ;;
+    esac
+  done
+}
+
+cmd_help() {
+  cat <<EOF
+cca — Claude Code Accounts ($VERSION)
+
+Run multiple Claude Code (CLI) subscriptions side by side. Each profile has
+its own long-lived OAuth token and config dir. Shared customisation
+(settings, hooks, agents, skills, plugins, commands) is symlinked from your
+main ~/.claude/, so changes in one place apply to all profiles.
+
+Scope: Claude Code CLI only — Claude Desktop / Cowork is not managed by cca.
+
+Usage:
+  cca                       interactive picker — choose a profile to switch to
+  cca ls                    list profiles, mark active, show auth state
+  cca active                print active profile name
+  cca add <name>            create profile <name> (mkdir + symlink shared)
+  cca login <name>          run \`claude setup-token\` and save token for <name>
+  cca switch <name>         emit export lines; use as:  eval "\$(cca switch <name>)"
+  cca rm <name>             delete profile <name>
+  cca refresh <name>        re-create symlinks for an existing profile
+  cca usage [name] [args]   show usage via ccusage; extra args pass through
+                              (e.g. \`cca usage personal daily --json\`)
+  cca init [shell]          install shell wrapper into your rc file
+                              (short prompt with [?] for details)
+  cca init --verbose        show full details up front (no [?] needed)
+  cca init -y               non-interactive install
+  cca init --print          print the wrapper instead of installing
+  cca version
+  cca help
+
+Switching:
+  eval "\$(cca switch personal)"     # sets CLAUDE_CONFIG_DIR + CLAUDE_CODE_OAUTH_TOKEN
+  eval "\$(cca switch main)"         # unsets both, fall back to Keychain
+
+Or install the shell wrapper once and skip the eval:
+  cca init                            # interactive install (asks before writing)
+  exec \$SHELL                         # reload
+  cca switch personal                 # now this just works
+
+How auth isolation works:
+  cca stores a per-profile long-lived OAuth token (via \`claude setup-token\`)
+  at ~/.claude-<name>/.cca-token (mode 0600). \`cca switch\` sets
+  CLAUDE_CODE_OAUTH_TOKEN in your current shell — that env var overrides the
+  macOS Keychain entry per Claude Code's documented auth precedence, so each
+  terminal can run as a different account simultaneously.
+EOF
+}
+
+cmd_version() { printf 'cca %s\n' "$VERSION"; }
+
+cmd_ls() {
+  local active_dir
+  active_dir="$(_active_dir)"
+  printf '%-12s %-8s %-12s %s\n' 'PROFILE' 'STATUS' 'AUTH' 'PATH'
+  while read -r dir; do
+    [ -d "$dir" ] || continue
+    local name mark auth
+    name="$(_profile_name_of_dir "$dir")"
+    if [ "$dir" = "$active_dir" ]; then mark='* active'; else mark='-'; fi
+    if [ "$name" = "main" ]; then
+      auth='keychain'
+    elif _has_token "$dir"; then
+      auth='token'
+    else
+      auth='(no token)'
+    fi
+    printf '%-12s %-8s %-12s %s\n' "$name" "$mark" "$auth" "$dir"
+  done < <(_list_profile_dirs)
+}
+
+cmd_active() {
+  _profile_name_of_dir "$(_active_dir)"
+  echo
+}
+
+cmd_add() {
+  local name="${1:-}"
+  [ -n "$name" ] || _die "usage: cca add <name>"
+  [ "$name" != "main" ] && [ "$name" != "default" ] || _die "reserved name: $name"
+  local dir
+  dir="$(_profile_dir "$name")"
+  [ ! -e "$dir" ] || _die "profile already exists: $dir"
+
+  mkdir -p "$dir"
+  : > "$dir/$PROFILE_MARKER_NAME"
+  # Pre-create projects/ so tools like ccusage don't error before the
+  # profile has any sessions yet.
+  mkdir -p "$dir/projects"
+  local item src
+  for item in "${SHARED_ITEMS[@]}"; do
+    src="$CLAUDE_HOME/$item"
+    if [ -e "$src" ]; then
+      ln -s "$src" "$dir/$item"
+    fi
+  done
+  printf 'Created profile %s at %s\n' "$name" "$dir"
+  printf 'Next: cca login %s\n' "$name"
+}
+
+cmd_refresh() {
+  local name="${1:-}"
+  [ -n "$name" ] || _die "usage: cca refresh <name>"
+  local dir
+  dir="$(_profile_dir "$name")"
+  [ -d "$dir" ] || _die "no such profile: $name"
+  local item src target
+  for item in "${SHARED_ITEMS[@]}"; do
+    src="$CLAUDE_HOME/$item"
+    target="$dir/$item"
+    [ -L "$target" ] && rm "$target"
+    if [ -e "$src" ] && [ ! -e "$target" ]; then
+      ln -s "$src" "$target"
+    fi
+  done
+  printf 'Refreshed symlinks for %s\n' "$name"
+}
+
+cmd_rm() {
+  local name="${1:-}"
+  [ -n "$name" ] || _die "usage: cca rm <name>"
+  [ "$name" != "main" ] && [ "$name" != "default" ] || _die "cannot remove the main profile"
+  local dir
+  dir="$(_profile_dir "$name")"
+  [ -d "$dir" ] || _die "no such profile: $name"
+  printf 'About to delete profile dir: %s\n' "$dir"
+  printf 'This removes the stored token and per-profile state.\n'
+  printf 'Shared items are symlinks; originals in ~/.claude/ are untouched.\n'
+  printf 'Type the profile name to confirm: '
+  local reply
+  read -r reply
+  [ "$reply" = "$name" ] || _die "aborted (got: $reply)"
+  rm -rf "$dir"
+  printf 'Removed %s\n' "$dir"
+}
+
+cmd_login() {
+  local name="${1:-}"
+  [ -n "$name" ] || _die "usage: cca login <name>"
+  [ "$name" != "main" ] && [ "$name" != "default" ] || _die "main uses Keychain — run 'claude /login' directly"
+  local dir
+  dir="$(_profile_dir "$name")"
+  [ -d "$dir" ] || _die "no such profile: $name (run: cca add $name)"
+
+  _info ""
+  _info "About to run 'claude setup-token' to generate a long-lived OAuth token for"
+  _info "profile '$name'. This will open your browser. Log in with the account you"
+  _info "want to associate with this profile, then return here."
+  _info ""
+  _info "Press Enter to continue (or Ctrl+C to cancel)..."
+  read -r _
+
+  _info ""
+  _info "─── claude setup-token ───"
+  claude setup-token
+  _info "───────────────────────────"
+  _info ""
+  _info "Copy the OAuth token printed above. (Input is hidden as you paste.)"
+  printf 'Paste token for %s: ' "$name" >&2
+  local token
+  read -r -s token
+  echo >&2
+
+  [ -n "$token" ] || _die "no token provided"
+
+  # Basic sanity check: tokens look like long opaque strings
+  if [ "${#token}" -lt 20 ]; then
+    _die "that doesn't look like a token (got ${#token} chars)"
+  fi
+
+  # Save with restrictive permissions
+  local token_file="$dir/$TOKEN_FILE_NAME"
+  umask 077
+  printf '%s' "$token" > "$token_file"
+  chmod 600 "$token_file"
+
+  _info "Saved token for '$name' to $token_file (mode 0600)"
+  _info ""
+  if [ "${CCA_WRAPPED:-}" = "1" ]; then
+    _info "Next: cca switch $name"
+  else
+    _info "Next: eval \"\$(cca switch $name)\""
+    _info "      (or run 'cca init' first to skip the eval dance)"
+  fi
+}
+
+cmd_switch() {
+  local name="${1:-}"
+  [ -n "$name" ] || _die "usage: cca switch <name>"
+
+  # If stdout is a TTY, the user almost certainly ran `cca switch X` directly
+  # without `eval "$(...)"`. The export lines we print won't affect their
+  # shell. Warn loudly and tell them how to fix it.
+  _maybe_warn_not_eval() {
+    if [ -t 1 ]; then
+      cat >&2 <<EOF
+
+⚠  Heads up — these export lines won't change your shell unless you eval them.
+   Run instead:
+       eval "\$(cca switch $name)"
+   Or install the wrapper function once with:
+       eval "\$(cca init zsh)"            # try this in your shell
+       cca init zsh >> ~/.zshrc           # persist for new shells
+   After that, plain \`cca switch $name\` works.
+
+EOF
+    fi
+  }
+
+  if [ "$name" = "main" ] || [ "$name" = "default" ]; then
+    # Switching back to main: unset both vars so Keychain creds resume.
+    _maybe_warn_not_eval
+    printf 'unset CLAUDE_CONFIG_DIR CLAUDE_CODE_OAUTH_TOKEN\n'
+    _info "cca: switched to main (Keychain auth)."
+    return
+  fi
+
+  local dir token
+  dir="$(_profile_dir "$name")"
+  [ -d "$dir" ] || _die "no such profile: $name (run: cca add $name)"
+  token="$(_read_token "$dir")"
+  [ -n "$token" ] || _die "no token saved for $name (run: cca login $name)"
+
+  _maybe_warn_not_eval
+  printf 'export CLAUDE_CONFIG_DIR=%q\n' "$dir"
+  printf 'export CLAUDE_CODE_OAUTH_TOKEN=%q\n' "$token"
+  _info "cca: switched to $name."
+}
+
+# Detect the user's shell from $SHELL (basename), with fallback to zsh.
+_detect_shell() {
+  local s="${SHELL:-}"
+  case "${s##*/}" in
+    zsh)  printf 'zsh'  ;;
+    bash) printf 'bash' ;;
+    *)    printf '%s' "${s##*/}" ;;
+  esac
+}
+
+# Resolve the rc file we'd append the wrapper to, given a shell name.
+_rc_file_for() {
+  case "$1" in
+    zsh)
+      printf '%s/.zshrc' "$HOME"
+      ;;
+    bash)
+      # macOS: ~/.bash_profile is what login shells read. Prefer it if it
+      # exists, otherwise ~/.bashrc.
+      if [ -f "$HOME/.bash_profile" ]; then
+        printf '%s/.bash_profile' "$HOME"
+      else
+        printf '%s/.bashrc' "$HOME"
+      fi
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# Short, friendly prompt header — used by default.
+_show_init_short() {
+  local rc="$1"
+  {
+    printf '\n'
+    printf 'cca needs a small wrapper in %s%s%s so %scca switch X%s works in your current shell.\n' \
+      "$CYAN" "$rc" "$RESET" "$BOLD" "$RESET"
+    printf '\n'
+  } >&2
+}
+
+# Detailed view — shown when user picks `?` or passes --verbose.
+_show_init_details() {
+  local rc="$1"
+  {
+    printf '\n'
+    printf '%sWhy:%s a child process can'\''t change its parent shell'\''s env vars.\n' "$BOLD" "$RESET"
+    printf '%s     %scca switch X%s only %sprints%s export lines; the wrapper intercepts and\n' \
+      "$DIM" "$CYAN" "$DIM" "$BOLD" "$DIM"
+    printf '%s     auto-evals them, so env changes stick. Other subcommands pass through.%s\n' "$DIM" "$RESET"
+    printf '\n'
+    printf '%sWill append to %s%s%s:\n' "$BOLD" "$CYAN" "$rc" "$RESET"
+    _emit_wrapper | sed "s/^/${DIM}  │  ${RESET}/"
+    printf '\n'
+  } >&2
+}
+
+# Y/n prompt. Returns 0 on yes, 1 on no.
+_prompt_yn_init() {
+  local reply
+  printf '%sInstall?%s [Y]es  [n]o ' "$BOLD" "$RESET" >&2
+  read -r reply
+  case "$reply" in
+    ''|y|Y|yes|YES) return 0 ;;
+    *)              return 1 ;;
+  esac
+}
+
+# Y/n/? prompt. On ? shows details once, then falls through to Y/n.
+# Returns 0 on yes, 1 on no.
+_prompt_yn_init_with_details() {
+  local rc="$1" reply
+  printf '%sInstall?%s [Y]es  [n]o  [?] show details ' "$BOLD" "$RESET" >&2
+  read -r reply
+  case "$reply" in
+    \?)
+      _show_init_details "$rc"
+      _prompt_yn_init
+      ;;
+    ''|y|Y|yes|YES) return 0 ;;
+    *)              return 1 ;;
+  esac
+}
+
+# Emit the wrapper function for a shell (zsh or bash; same syntax).
+# Exports CCA_WRAPPED=1 so subprocess `cca` calls can detect when they're
+# running under a wrapped shell (and skip the "reload your shell" nag).
+_emit_wrapper() {
+  cat <<'SHELL'
+# cca shell wrapper — makes `cca switch X` and bare `cca` (picker) modify
+# the current shell directly. Installed by `cca init`.
+export CCA_WRAPPED=1
+cca() {
+  case "${1:-}" in
+    switch|sw|'')
+      local _out
+      _out="$(command cca "$@")" || return $?
+      [ -n "$_out" ] && eval "$_out"
+      ;;
+    *)
+      command cca "$@"
+      ;;
+  esac
+}
+SHELL
+}
+
+cmd_init() {
+  local yes=0
+  local print_only=0
+  local verbose=0
+  local shell=""
+
+  # Args (order-independent):
+  #   --yes / -y     skip the interactive confirmation
+  #   --print        print the wrapper to stdout instead of installing
+  #   --verbose      show the detailed "why" + full code block by default
+  #   zsh | bash     force a shell (overrides $SHELL detection)
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes|-y)      yes=1 ;;
+      --print)       print_only=1 ;;
+      --verbose)     verbose=1 ;;
+      zsh|bash)      shell="$1" ;;
+      '')            ;;
+      *)             _die "unknown arg: $1 (usage: cca init [zsh|bash] [--yes] [--print] [--verbose])" ;;
+    esac
+    shift
+  done
+
+  if [ -z "$shell" ]; then
+    shell="$(_detect_shell)"
+  fi
+
+  case "$shell" in
+    zsh|bash) ;;
+    *) _die "unsupported shell: ${shell:-<unknown>} (set \$SHELL to /bin/zsh or /bin/bash, or pass: cca init zsh|bash)" ;;
+  esac
+
+  # --print mode: emit wrapper, no side effects.
+  if [ "$print_only" -eq 1 ]; then
+    _emit_wrapper
+    return 0
+  fi
+
+  local rc
+  rc="$(_rc_file_for "$shell")" || _die "couldn't resolve rc file for $shell"
+
+  # Already installed? Bail out cleanly.
+  if [ -f "$rc" ] && grep -q "^# cca shell wrapper" "$rc"; then
+    if [ "${CCA_WRAPPED:-}" = "1" ]; then
+      printf '%s✓%s cca: wrapper already installed and active in this shell.\n' "$GREEN" "$RESET" >&2
+    else
+      printf '%s✓%s cca: wrapper already installed in %s%s%s\n' "$GREEN" "$RESET" "$CYAN" "$rc" "$RESET" >&2
+      printf '  To activate it in this shell: %ssource %s%s\n' "$BOLD" "$rc" "$RESET" >&2
+    fi
+    return 0
+  fi
+
+  # Confirm before writing, unless --yes was passed or stdin isn't a TTY
+  # (in pipelines / scripts, default to non-interactive install).
+  if [ "$yes" -eq 0 ] && [ -t 0 ]; then
+    if [ "$verbose" -eq 1 ]; then
+      _show_init_details "$rc"
+      _prompt_yn_init "$rc" || { _info "cca: aborted, no changes made."; return 1; }
+    else
+      _show_init_short "$rc"
+      _prompt_yn_init_with_details "$rc" || { _info "cca: aborted, no changes made."; return 1; }
+    fi
+  fi
+
+  {
+    printf '\n'
+    _emit_wrapper
+  } >> "$rc"
+  printf '%s✓%s cca: wrapper appended to %s%s%s\n' "$GREEN" "$RESET" "$CYAN" "$rc" "$RESET" >&2
+  printf '\n' >&2
+  printf '  To activate in this shell (pick one):\n' >&2
+  printf '    %ssource %s%s          %s# gentler — keeps shell state%s\n' "$BOLD" "$rc" "$RESET" "$DIM" "$RESET" >&2
+  printf '    %sexec %s%s             %s# nuclear — fresh shell%s\n' "$BOLD" "$shell" "$RESET" "$DIM" "$RESET" >&2
+  printf '\n' >&2
+  printf '  %sNew terminal windows pick it up automatically.%s\n' "$DIM" "$RESET" >&2
+}
+
+# Resolve a ccusage runner. Prefers a globally-installed `ccusage`, falls back
+# to `bunx`, then `npx`. Sets _CCUSAGE_CMD on success; returns 1 if nothing
+# usable is on PATH.
+_resolve_ccusage() {
+  if command -v ccusage >/dev/null 2>&1; then
+    _CCUSAGE_CMD="ccusage"
+  elif command -v bunx >/dev/null 2>&1; then
+    _CCUSAGE_CMD="bunx ccusage"
+  elif command -v npx >/dev/null 2>&1; then
+    _CCUSAGE_CMD="npx -y ccusage@latest"
+  else
+    return 1
+  fi
+}
+
+cmd_usage() {
+  if ! _resolve_ccusage; then
+    cat <<EOF >&2
+cca usage requires ccusage. Install one of:
+  - ccusage globally:  bun add -g ccusage   (or:  npm i -g ccusage)
+  - bun (provides bunx):  https://bun.sh
+  - node (provides npx):  https://nodejs.org
+
+See: https://github.com/ryoppippi/ccusage
+EOF
+    return 1
+  fi
+
+  local target="${1:-}"
+  # Anything after the target is passed through to ccusage (e.g. `cca usage personal daily`).
+  if [ -n "$target" ]; then
+    shift
+    _usage_one "$target" "$@"
+  else
+    local dir name first=1
+    while read -r dir; do
+      [ -d "$dir" ] || continue
+      name="$(_profile_name_of_dir "$dir")"
+      [ "$first" -eq 1 ] || printf '\n'
+      first=0
+      _usage_one "$name" "$@"
+    done < <(_list_profile_dirs)
+  fi
+}
+
+_usage_one() {
+  local name="$1"
+  shift
+  local dir
+  dir="$(_profile_dir "$name")"
+  if [ ! -d "$dir" ]; then
+    _warn "no such profile: $name"; return
+  fi
+
+  printf '%s── %s%s%s ──%s\n' "$BOLD" "$CYAN" "$name" "$BOLD" "$RESET"
+
+  # Ensure projects/ exists so ccusage doesn't error for never-used profiles.
+  [ -d "$dir/projects" ] || mkdir -p "$dir/projects"
+
+  # Run ccusage with CLAUDE_CONFIG_DIR pointed at this profile.
+  # Pass any extra args straight through (e.g. daily, monthly, --json).
+  CLAUDE_CONFIG_DIR="$dir" $_CCUSAGE_CMD "$@" || _warn "ccusage failed for $name"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# main
+# ─────────────────────────────────────────────────────────────────────────────
+
+main() {
+  # No args: interactive profile picker if we're on a TTY, otherwise help.
+  if [ $# -eq 0 ]; then
+    if [ -t 0 ] && [ -t 2 ]; then
+      local picked
+      picked="$(_picker)" || return 1
+      [ -n "$picked" ] || return 1
+      cmd_switch "$picked"
+      return $?
+    else
+      cmd_help
+      return
+    fi
+  fi
+
+  local cmd="$1"
+  shift
+  case "$cmd" in
+    help|-h|--help)        cmd_help "$@" ;;
+    version|-v|--version)  cmd_version ;;
+    ls|list)               cmd_ls "$@" ;;
+    active|current)        cmd_active "$@" ;;
+    add|new)               cmd_add "$@" ;;
+    refresh)               cmd_refresh "$@" ;;
+    rm|remove|delete)      cmd_rm "$@" ;;
+    login)                 cmd_login "$@" ;;
+    switch|sw)             cmd_switch "$@" ;;
+    usage)                 cmd_usage "$@" ;;
+    init)                  cmd_init "$@" ;;
+    *) _die "unknown command: $cmd (try 'cca help')" ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,7 @@
+.DS_Store
+*.swp
+*.swo
+*~
+
+# personal scratch dirs sometimes left during testing
+/tmp-test/
