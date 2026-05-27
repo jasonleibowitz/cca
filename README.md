@@ -1,4 +1,7 @@
-# cca — Claude Code Accounts
+<div align="center">
+    <img src="assets/cca-logo.png" alt="cca logo" width="256" height="256">
+    <h1>cca (Claude Code Accounts)</h1>
+</div>
 
 Run multiple Claude Code (CLI) subscriptions side by side, in parallel
 terminals. Each profile has its own long-lived OAuth token and config dir.
@@ -115,18 +118,18 @@ re-appending.
 
 ## Commands
 
-| Command | Description |
-|---|---|
-| `cca ls` | List profiles, mark active, show auth state |
-| `cca active` | Print active profile name |
-| `cca add <name>` | Create profile dir + symlink shared items |
-| `cca login <name>` | Run `claude setup-token`, save the printed token |
-| `cca switch <name>` | Emit `eval`-friendly export lines |
-| `cca rename <old> <new>` | Rename a profile (alias: `cca mv`) |
-| `cca rm <name>` | Delete profile dir (confirms first) |
-| `cca refresh <name>` | Re-create symlinks (after adding new items to `~/.claude/`) |
-| `cca usage [name]` | Activity heatmap (12-month) + summary card per profile, built from local session transcripts |
-| `cca version` / `cca help` | Self-explanatory |
+| Command                    | Description                                                                                  |
+| -------------------------- | -------------------------------------------------------------------------------------------- |
+| `cca ls`                   | List profiles, mark active, show auth state                                                  |
+| `cca active`               | Print active profile name                                                                    |
+| `cca add <name>`           | Create profile dir + symlink shared items                                                    |
+| `cca login <name>`         | Run `claude setup-token`, save the printed token                                             |
+| `cca switch <name>`        | Emit `eval`-friendly export lines                                                            |
+| `cca rename <old> <new>`   | Rename a profile (alias: `cca mv`)                                                           |
+| `cca rm <name>`            | Delete profile dir (confirms first)                                                          |
+| `cca refresh <name>`       | Re-create symlinks (after adding new items to `~/.claude/`)                                  |
+| `cca usage [name]`         | Activity heatmap (12-month) + summary card per profile, built from local session transcripts |
+| `cca version` / `cca help` | Self-explanatory                                                                             |
 
 ## What gets shared vs kept per-profile
 
