@@ -39,6 +39,14 @@ no re-login, no contamination.
 
 ### Installation
 
+**Homebrew (recommended):**
+
+```bash
+brew install jasonleibowitz/tap/cca
+```
+
+**Manual:**
+
 ```bash
 git clone https://github.com/jasonleibowitz/cca.git
 cd cca
