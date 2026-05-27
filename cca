@@ -8,7 +8,7 @@
 # https://github.com/<owner>/cca
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 
 CLAUDE_HOME="${HOME}/.claude"
 PROFILE_PREFIX="${HOME}/.claude-"
