@@ -115,7 +115,7 @@ _profile_name_of_dir() {
 # Priority: CLAUDE_CODE_OAUTH_TOKEN (if matches a known profile's token) →
 # CLAUDE_CONFIG_DIR → main.
 _active_dir() {
-  if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+  if [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [ -d "${CLAUDE_CONFIG_DIR}" ]; then
     printf '%s' "$CLAUDE_CONFIG_DIR"
   else
     printf '%s' "$CLAUDE_HOME"
