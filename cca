@@ -146,6 +146,46 @@ _read_token() {
   cat "$dir/$TOKEN_FILE_NAME"
 }
 
+# Print the newest mtime (as a unix epoch, integer) across all *.jsonl session
+# transcripts under each profile dir passed as an argument. Output has one line
+# per arg, in order; empty line means "no sessions yet". One python3 call
+# regardless of profile count so picker startup stays snappy.
+_profile_ages() {
+  /usr/bin/env python3 -c '
+import os, sys
+for d in sys.argv[1:]:
+    projects = os.path.join(d, "projects")
+    best = 0.0
+    if os.path.isdir(projects):
+        for root, _, files in os.walk(projects):
+            for f in files:
+                if not f.endswith(".jsonl"): continue
+                try:
+                    m = os.path.getmtime(os.path.join(root, f))
+                    if m > best: best = m
+                except OSError:
+                    pass
+    print(f"{best:.0f}" if best > 0 else "")
+' "$@"
+}
+
+# Render a unix epoch as a short relative age (e.g. "5m ago", "3d ago").
+# Empty input prints nothing — callers can use that to skip the suffix.
+_humanize_age() {
+  local epoch="$1"
+  [ -n "$epoch" ] || return 0
+  local now diff
+  now=$(date +%s)
+  diff=$((now - epoch))
+  [ "$diff" -ge 0 ] || diff=0
+  if   [ "$diff" -lt 60 ];      then printf 'just now'
+  elif [ "$diff" -lt 3600 ];    then printf '%dm ago' "$((diff / 60))"
+  elif [ "$diff" -lt 86400 ];   then printf '%dh ago' "$((diff / 3600))"
+  elif [ "$diff" -lt 2592000 ]; then printf '%dd ago' "$((diff / 86400))"
+  else                               printf '%dmo ago' "$((diff / 2592000))"
+  fi
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # commands
 # ─────────────────────────────────────────────────────────────────────────────
@@ -157,9 +197,10 @@ _picker() {
     return 1
   fi
 
-  local profiles=() dir
+  local profiles=() dirs=() dir
   while read -r dir; do
     [ -d "$dir" ] || continue
+    dirs+=("$dir")
     profiles+=("$(_profile_name_of_dir "$dir")")
   done < <(_list_profile_dirs)
 
@@ -168,6 +209,13 @@ _picker() {
     _warn "only the main profile exists. Run 'cca add <name>' to create another."
     return 1
   fi
+
+  # Precompute last-active labels once, parallel to profiles[], so the
+  # redraw loop below doesn't re-stat the filesystem on every keystroke.
+  local ages=() epoch
+  while IFS= read -r epoch; do
+    ages+=("$(_humanize_age "$epoch")")
+  done < <(_profile_ages "${dirs[@]}")
 
   local active sel=0 i
   active="$(_profile_name_of_dir "$(_active_dir)")"
@@ -195,12 +243,13 @@ _picker() {
 
     for i in "${!profiles[@]}"; do
       tput el >&2
-      local cur_marker=''
+      local cur_marker='' age_marker=''
       [ "${profiles[$i]}" = "$active" ] && cur_marker=" ${DIM}(current)${RESET}"
+      [ -n "${ages[$i]}" ] && age_marker=" ${DIM}· ${ages[$i]}${RESET}"
       if [ "$i" -eq "$sel" ]; then
-        printf '%s❯%s %s%s%s%s\n' "$ORANGE" "$RESET" "$BOLD" "${profiles[$i]}" "$RESET" "$cur_marker" >&2
+        printf '%s❯%s %s%s%s%s%s\n' "$ORANGE" "$RESET" "$BOLD" "${profiles[$i]}" "$RESET" "$age_marker" "$cur_marker" >&2
       else
-        printf '  %s%s\n' "${profiles[$i]}" "$cur_marker" >&2
+        printf '  %s%s%s\n' "${profiles[$i]}" "$age_marker" "$cur_marker" >&2
       fi
     done
     tput el >&2
