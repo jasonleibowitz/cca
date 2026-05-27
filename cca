@@ -199,7 +199,7 @@ _picker() {
       local cur_marker=''
       [ "${profiles[$i]}" = "$active" ] && cur_marker=" ${DIM}(current)${RESET}"
       if [ "$i" -eq "$sel" ]; then
-        printf '%s❯%s %s%s%s%s\n' "$CYAN" "$RESET" "$BOLD" "${profiles[$i]}" "$RESET" "$cur_marker" >&2
+        printf '%s❯%s %s%s%s%s\n' "$ORANGE" "$RESET" "$BOLD" "${profiles[$i]}" "$RESET" "$cur_marker" >&2
       else
         printf '  %s%s\n' "${profiles[$i]}" "$cur_marker" >&2
       fi
@@ -247,52 +247,63 @@ _picker() {
 }
 
 cmd_help() {
+  # Re-evaluate styling based on stdout (where help is written) being a TTY,
+  # so piping to a file or pager doesn't sprinkle ANSI codes.
+  local B='' D='' C='' R=''
+  if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && command -v tput >/dev/null 2>&1; then
+    B="$(tput bold 2>/dev/null || true)"
+    D="$(tput dim 2>/dev/null || true)"
+    R="$(tput sgr0 2>/dev/null || true)"
+    # Use Claude orange (xterm-256 color 208) for command names + paths;
+    # fall back to yellow when the terminal only supports 16 colors.
+    if [ "$(tput colors 2>/dev/null || echo 0)" -ge 256 ]; then
+      C="$(tput setaf 208 2>/dev/null || true)"
+    else
+      C="$(tput setaf 3 2>/dev/null || true)"
+    fi
+  fi
+
+  # Helper: format a command row.  $1 = command (cyan), $2 = description (plain).
+  local row='printf "  %s%-26s%s%s\n"'
+
   cat <<EOF
-cca — Claude Code Accounts ($VERSION)
+${B}${C}cca${R} ${D}— Claude Code Accounts (${VERSION})${R}
 
 Run multiple Claude Code (CLI) subscriptions side by side. Each profile has
 its own long-lived OAuth token and config dir. Shared customisation
 (settings, hooks, agents, skills, plugins, commands) is symlinked from your
-main ~/.claude/, so changes in one place apply to all profiles.
+main ${C}~/.claude/${R}, so changes in one place apply to all profiles.
 
-Scope: Claude Code CLI only — Claude Desktop / Cowork is not managed by cca.
+${D}Scope: Claude Code CLI only — Claude Desktop / Cowork is not managed by cca.${R}
 
-Usage:
-  cca                       interactive picker — choose a profile to switch to
-  cca ls                    list profiles, mark active, show auth state
-  cca active                print active profile name
-  cca add <name>            create profile <name> (mkdir + symlink shared)
-  cca login <name>          run \`claude setup-token\` and save token for <name>
-  cca switch <name>         emit export lines; use as:  eval "\$(cca switch <name>)"
-  cca rename <old> <new>    rename profile (also: cca mv)
-  cca rm <name>             delete profile <name>
-  cca refresh <name>        re-create symlinks for an existing profile
-  cca usage [name]          heatmap + summary for one profile
-                              (defaults to the active profile)
-  cca usage --all           same, for every profile
-  cca init [shell]          install shell wrapper into your rc file
-                              (short prompt with [?] for details)
-  cca init --verbose        show full details up front (no [?] needed)
-  cca init -y               non-interactive install
-  cca init --print          print the wrapper instead of installing
-  cca version
-  cca help
+${B}Usage:${R}
+  ${C}cca${R}                       interactive picker — choose a profile to switch to
+  ${C}cca ls${R}                    list profiles, mark active, show auth state
+  ${C}cca active${R}                print active profile name
+  ${C}cca add${R} <name>            create profile <name> (mkdir + symlink shared)
+  ${C}cca login${R} <name>          run \`claude setup-token\` and save token for <name>
+  ${C}cca switch${R} <name>         switch the active profile in this shell
+  ${C}cca rename${R} <old> <new>    rename profile (also: ${C}cca mv${R})
+  ${C}cca rm${R} <name>             delete profile <name>
+  ${C}cca refresh${R} <name>        re-create symlinks for an existing profile
+  ${C}cca usage${R} [name]          heatmap + summary for one profile
+                              ${D}(defaults to the active profile)${R}
+  ${C}cca usage${R} --all           same, for every profile
+  ${C}cca init${R} [shell]          install shell wrapper into your rc file
+                              ${D}(short prompt with [?] for details)${R}
+  ${C}cca init${R} --verbose        show full details up front (no [?] needed)
+  ${C}cca init${R} -y               non-interactive install
+  ${C}cca init${R} --print          print the wrapper instead of installing
+  ${C}cca version${R}
+  ${C}cca help${R}
 
-Switching:
-  eval "\$(cca switch personal)"     # sets CLAUDE_CONFIG_DIR + CLAUDE_CODE_OAUTH_TOKEN
-  eval "\$(cca switch main)"         # unsets both, fall back to Keychain
+${B}Switching:${R}
+  ${C}cca switch personal${R}       ${D}# use the personal profile in this shell${R}
+  ${C}cca switch main${R}           ${D}# back to main (Keychain auth)${R}
+  ${C}cca${R}                       ${D}# interactive picker${R}
 
-Or install the shell wrapper once and skip the eval:
-  cca init                            # interactive install (asks before writing)
-  exec \$SHELL                         # reload
-  cca switch personal                 # now this just works
-
-How auth isolation works:
-  cca stores a per-profile long-lived OAuth token (via \`claude setup-token\`)
-  at ~/.claude-<name>/.cca-token (mode 0600). \`cca switch\` sets
-  CLAUDE_CODE_OAUTH_TOKEN in your current shell — that env var overrides the
-  macOS Keychain entry per Claude Code's documented auth precedence, so each
-  terminal can run as a different account simultaneously.
+  ${D}Requires the shell wrapper (one-time setup):${R}  ${C}cca init${R}
+  ${D}Without it, wrap manually:${R}  ${C}eval "\$(cca switch <name>)"${R}
 EOF
 }
 
@@ -383,7 +394,7 @@ cmd_rename() {
   if [ "$new" = "main" ] || [ "$new" = "default" ]; then
     if [ "$old_dir" = "$CLAUDE_HOME" ]; then
       rm -f "$CLAUDE_HOME/$LABEL_FILE_NAME"
-      printf 'Removed label; %s%s%s is back to "main".\n' "$CYAN" "$CLAUDE_HOME" "$RESET"
+      printf 'Removed label; %s%s%s is back to "main".\n' "$ORANGE" "$CLAUDE_HOME" "$RESET"
       return
     fi
     _die "reserved name: $new"
@@ -403,7 +414,7 @@ cmd_rename() {
     # Renaming main: write a label (dir stays at ~/.claude/).
     printf '%s\n' "$new" > "$CLAUDE_HOME/$LABEL_FILE_NAME"
     chmod 600 "$CLAUDE_HOME/$LABEL_FILE_NAME" 2>/dev/null || true
-    printf 'Renamed main → %s%s%s\n' "$CYAN" "$new" "$RESET"
+    printf 'Renamed main → %s%s%s\n' "$ORANGE" "$new" "$RESET"
     printf '  %s(label only — %s%s%s stays at %s)%s\n' \
       "$DIM" "$RESET" "$DIM" "$CLAUDE_HOME" "$CLAUDE_HOME" "$RESET"
   else
@@ -413,7 +424,7 @@ cmd_rename() {
     # Drop any stale label inside the renamed dir — the new dir name is canonical.
     rm -f "$new_dir/$LABEL_FILE_NAME"
     printf 'Renamed %s → %s\n' "$old" "$new"
-    printf '  %s%s%s -> %s%s%s\n' "$DIM" "$old_dir" "$RESET" "$CYAN" "$new_dir" "$RESET"
+    printf '  %s%s%s -> %s%s%s\n' "$DIM" "$old_dir" "$RESET" "$ORANGE" "$new_dir" "$RESET"
     # Warn if the renamed profile is active in the caller's shell.
     if [ "${CLAUDE_CONFIG_DIR:-}" = "$old_dir" ]; then
       printf '\n%s⚠%s  Your current shell has CLAUDE_CONFIG_DIR pointing at the old path.\n' "$YELLOW" "$RESET"
@@ -572,7 +583,7 @@ _show_init_short() {
   {
     printf '\n'
     printf 'cca needs a small wrapper in %s%s%s so %scca switch X%s works in your current shell.\n' \
-      "$CYAN" "$rc" "$RESET" "$BOLD" "$RESET"
+      "$ORANGE" "$rc" "$RESET" "$BOLD" "$RESET"
     printf '\n'
   } >&2
 }
@@ -584,10 +595,10 @@ _show_init_details() {
     printf '\n'
     printf '%sWhy:%s a child process can'\''t change its parent shell'\''s env vars.\n' "$BOLD" "$RESET"
     printf '%s     %scca switch X%s only %sprints%s export lines; the wrapper intercepts and\n' \
-      "$DIM" "$CYAN" "$DIM" "$BOLD" "$DIM"
+      "$DIM" "$ORANGE" "$DIM" "$BOLD" "$DIM"
     printf '%s     auto-evals them, so env changes stick. Other subcommands pass through.%s\n' "$DIM" "$RESET"
     printf '\n'
-    printf '%sWill append to %s%s%s:\n' "$BOLD" "$CYAN" "$rc" "$RESET"
+    printf '%sWill append to %s%s%s:\n' "$BOLD" "$ORANGE" "$rc" "$RESET"
     _emit_wrapper | sed "s/^/${DIM}  │  ${RESET}/"
     printf '\n'
   } >&2
@@ -689,7 +700,7 @@ cmd_init() {
     if [ "${CCA_WRAPPED:-}" = "1" ]; then
       printf '%s✓%s cca: wrapper already installed and active in this shell.\n' "$GREEN" "$RESET" >&2
     else
-      printf '%s✓%s cca: wrapper already installed in %s%s%s\n' "$GREEN" "$RESET" "$CYAN" "$rc" "$RESET" >&2
+      printf '%s✓%s cca: wrapper already installed in %s%s%s\n' "$GREEN" "$RESET" "$ORANGE" "$rc" "$RESET" >&2
       printf '  To activate it in this shell: %ssource %s%s\n' "$BOLD" "$rc" "$RESET" >&2
     fi
     return 0
@@ -711,7 +722,7 @@ cmd_init() {
     printf '\n'
     _emit_wrapper
   } >> "$rc"
-  printf '%s✓%s cca: wrapper appended to %s%s%s\n' "$GREEN" "$RESET" "$CYAN" "$rc" "$RESET" >&2
+  printf '%s✓%s cca: wrapper appended to %s%s%s\n' "$GREEN" "$RESET" "$ORANGE" "$rc" "$RESET" >&2
   printf '\n' >&2
   printf '  To activate in this shell (pick one):\n' >&2
   printf '    %ssource %s%s          %s# gentler — keeps shell state%s\n' "$BOLD" "$rc" "$RESET" "$DIM" "$RESET" >&2
@@ -761,18 +772,18 @@ _usage_one() {
   # Read all JSONL session transcripts in the profile and render a /stats-like
   # heatmap + summary. No external deps — uses the Python that's already on
   # PATH for the rest of cca.
-  /usr/bin/env python3 - "$dir" "$name" "${BOLD}" "${DIM}" "${CYAN}" "${GREEN}" "${ORANGE}" "${RESET}" <<'PY'
+  /usr/bin/env python3 - "$dir" "$name" "${BOLD}" "${DIM}" "${GREEN}" "${ORANGE}" "${RESET}" <<'PY'
 import json, os, sys
 from collections import defaultdict, Counter
 from datetime import datetime, timedelta, date
 
 profile_dir = sys.argv[1]
 display     = sys.argv[2]
-BOLD, DIM, CYAN, GREEN, ORANGE, RESET = sys.argv[3:9]
+BOLD, DIM, GREEN, ORANGE, RESET = sys.argv[3:8]
 
 projects = os.path.join(profile_dir, "projects")
 if not os.path.isdir(projects):
-    print(f"  {BOLD}{CYAN}{display}{RESET}: no usage yet (no projects/ directory)")
+    print(f"  {BOLD}{ORANGE}{display}{RESET}: no usage yet (no projects/ directory)")
     sys.exit(0)
 
 day_tokens     = defaultdict(int)     # date -> total tokens
@@ -861,7 +872,7 @@ while i < len(cols):
     i = end
 
 print()
-print(f"  {BOLD}{CYAN}{display}{RESET}")
+print(f"  {BOLD}{ORANGE}{display}{RESET}")
 print()
 print(f"  {DIM}{month_line.rstrip()}{RESET}")
 
