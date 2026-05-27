@@ -34,6 +34,7 @@ SHARED_ITEMS=(
 # after `add`/`refresh`. The token file is the one cca writes:
 TOKEN_FILE_NAME=".cca-token"
 PROFILE_MARKER_NAME=".cca-profile"
+LABEL_FILE_NAME=".cca-label"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # helpers
@@ -52,23 +53,58 @@ if [ -t 2 ] && [ -z "${NO_COLOR:-}" ] && command -v tput >/dev/null 2>&1; then
   YELLOW="$(tput setaf 3 2>/dev/null || true)"
   GREEN="$(tput setaf 2 2>/dev/null || true)"
   RESET="$(tput sgr0 2>/dev/null || true)"
+  # Orange — xterm-256 color 208. Fall back to yellow if the terminal
+  # only supports 8/16 colors.
+  if [ "$(tput colors 2>/dev/null || echo 0)" -ge 256 ]; then
+    ORANGE="$(tput setaf 208 2>/dev/null || true)"
+  else
+    ORANGE="$YELLOW"
+  fi
 else
-  BOLD=''; DIM=''; CYAN=''; YELLOW=''; GREEN=''; RESET=''
+  BOLD=''; DIM=''; CYAN=''; YELLOW=''; GREEN=''; ORANGE=''; RESET=''
 fi
 
-# Resolve <name> → absolute profile dir. "main" / "default" → ~/.claude.
+# Read a profile dir's label, if any. Empty string if no label is set.
+_read_label() {
+  local d="${1%/}"
+  local f="$d/$LABEL_FILE_NAME"
+  [ -f "$f" ] || return 0
+  head -n1 "$f" 2>/dev/null | tr -d '[:space:]'
+}
+
+# Resolve <name> → absolute profile dir.
+#   "main" / "default" always → ~/.claude (regardless of label)
+#   <name> matching a label → that profile's dir
+#   <name> otherwise → ~/.claude-<name>
 _profile_dir() {
   local name="$1"
   if [ "$name" = "main" ] || [ "$name" = "default" ]; then
     printf '%s' "$CLAUDE_HOME"
-  else
-    printf '%s%s' "$PROFILE_PREFIX" "$name"
+    return
   fi
+  # Scan for label match across main + all ~/.claude-* profiles.
+  local d label
+  for d in "$CLAUDE_HOME" "${PROFILE_PREFIX}"*; do
+    [ -d "$d" ] || continue
+    label="$(_read_label "$d")"
+    if [ -n "$label" ] && [ "$label" = "$name" ]; then
+      printf '%s' "$d"
+      return
+    fi
+  done
+  printf '%s%s' "$PROFILE_PREFIX" "$name"
 }
 
-# Inverse: absolute dir → display name. Returns "main" for ~/.claude.
+# Inverse: absolute dir → display name. Prefers a label if present, otherwise
+# derives from the dir name. ~/.claude with no label → "main".
 _profile_name_of_dir() {
   local d="${1%/}"
+  local label
+  label="$(_read_label "$d")"
+  if [ -n "$label" ]; then
+    printf '%s' "$label"
+    return
+  fi
   if [ "$d" = "$CLAUDE_HOME" ]; then
     printf 'main'
   else
@@ -228,10 +264,12 @@ Usage:
   cca add <name>            create profile <name> (mkdir + symlink shared)
   cca login <name>          run \`claude setup-token\` and save token for <name>
   cca switch <name>         emit export lines; use as:  eval "\$(cca switch <name>)"
+  cca rename <old> <new>    rename profile (also: cca mv)
   cca rm <name>             delete profile <name>
   cca refresh <name>        re-create symlinks for an existing profile
-  cca usage [name] [args]   show usage via ccusage; extra args pass through
-                              (e.g. \`cca usage personal daily --json\`)
+  cca usage [name]          heatmap + summary for one profile
+                              (defaults to the active profile)
+  cca usage --all           same, for every profile
   cca init [shell]          install shell wrapper into your rc file
                               (short prompt with [?] for details)
   cca init --verbose        show full details up front (no [?] needed)
@@ -269,7 +307,7 @@ cmd_ls() {
     local name mark auth
     name="$(_profile_name_of_dir "$dir")"
     if [ "$dir" = "$active_dir" ]; then mark='* active'; else mark='-'; fi
-    if [ "$name" = "main" ]; then
+    if [ "$dir" = "$CLAUDE_HOME" ]; then
       auth='keychain'
     elif _has_token "$dir"; then
       auth='token'
@@ -291,6 +329,11 @@ cmd_add() {
   [ "$name" != "main" ] && [ "$name" != "default" ] || _die "reserved name: $name"
   local dir
   dir="$(_profile_dir "$name")"
+  # _profile_dir returns the label-matched dir if the name is already a label.
+  # If it matches an existing profile (including main with this label), reject.
+  if [ -d "$dir" ]; then
+    _die "profile already exists with name '$name' at $dir"
+  fi
   [ ! -e "$dir" ] || _die "profile already exists: $dir"
 
   mkdir -p "$dir"
@@ -327,13 +370,65 @@ cmd_refresh() {
   printf 'Refreshed symlinks for %s\n' "$name"
 }
 
+cmd_rename() {
+  local old="${1:-}" new="${2:-}"
+  [ -n "$old" ] && [ -n "$new" ] || _die "usage: cca rename <old> <new>"
+  [ "$old" != "$new" ] || _die "names are the same"
+
+  local old_dir
+  old_dir="$(_profile_dir "$old")"
+  [ -d "$old_dir" ] || _die "no such profile: $old"
+
+  # Renaming TO 'main'/'default': only allowed when undoing a label on ~/.claude.
+  if [ "$new" = "main" ] || [ "$new" = "default" ]; then
+    if [ "$old_dir" = "$CLAUDE_HOME" ]; then
+      rm -f "$CLAUDE_HOME/$LABEL_FILE_NAME"
+      printf 'Removed label; %s%s%s is back to "main".\n' "$CYAN" "$CLAUDE_HOME" "$RESET"
+      return
+    fi
+    _die "reserved name: $new"
+  fi
+
+  # Check the new name doesn't collide with another profile (dir or label).
+  local existing
+  existing="$(_profile_dir "$new")"
+  if [ "$existing" != "${PROFILE_PREFIX}${new}" ] && [ "$existing" != "$old_dir" ]; then
+    _die "profile already exists: $new"
+  fi
+  if [ -e "${PROFILE_PREFIX}${new}" ] && [ "${PROFILE_PREFIX}${new}" != "$old_dir" ]; then
+    _die "profile already exists: $new"
+  fi
+
+  if [ "$old_dir" = "$CLAUDE_HOME" ]; then
+    # Renaming main: write a label (dir stays at ~/.claude/).
+    printf '%s\n' "$new" > "$CLAUDE_HOME/$LABEL_FILE_NAME"
+    chmod 600 "$CLAUDE_HOME/$LABEL_FILE_NAME" 2>/dev/null || true
+    printf 'Renamed main → %s%s%s\n' "$CYAN" "$new" "$RESET"
+    printf '  %s(label only — %s%s%s stays at %s)%s\n' \
+      "$DIM" "$RESET" "$DIM" "$CLAUDE_HOME" "$CLAUDE_HOME" "$RESET"
+  else
+    # Physical rename for non-main profiles.
+    local new_dir="${PROFILE_PREFIX}${new}"
+    mv "$old_dir" "$new_dir"
+    # Drop any stale label inside the renamed dir — the new dir name is canonical.
+    rm -f "$new_dir/$LABEL_FILE_NAME"
+    printf 'Renamed %s → %s\n' "$old" "$new"
+    printf '  %s%s%s -> %s%s%s\n' "$DIM" "$old_dir" "$RESET" "$CYAN" "$new_dir" "$RESET"
+    # Warn if the renamed profile is active in the caller's shell.
+    if [ "${CLAUDE_CONFIG_DIR:-}" = "$old_dir" ]; then
+      printf '\n%s⚠%s  Your current shell has CLAUDE_CONFIG_DIR pointing at the old path.\n' "$YELLOW" "$RESET"
+      printf '   Run %scca switch %s%s to update this shell.\n' "$BOLD" "$new" "$RESET"
+    fi
+  fi
+}
+
 cmd_rm() {
   local name="${1:-}"
   [ -n "$name" ] || _die "usage: cca rm <name>"
-  [ "$name" != "main" ] && [ "$name" != "default" ] || _die "cannot remove the main profile"
   local dir
   dir="$(_profile_dir "$name")"
   [ -d "$dir" ] || _die "no such profile: $name"
+  [ "$dir" != "$CLAUDE_HOME" ] || _die "cannot remove the main profile (it lives at $CLAUDE_HOME)"
   printf 'About to delete profile dir: %s\n' "$dir"
   printf 'This removes the stored token and per-profile state.\n'
   printf 'Shared items are symlinks; originals in ~/.claude/ are untouched.\n'
@@ -348,10 +443,10 @@ cmd_rm() {
 cmd_login() {
   local name="${1:-}"
   [ -n "$name" ] || _die "usage: cca login <name>"
-  [ "$name" != "main" ] && [ "$name" != "default" ] || _die "main uses Keychain — run 'claude /login' directly"
   local dir
   dir="$(_profile_dir "$name")"
   [ -d "$dir" ] || _die "no such profile: $name (run: cca add $name)"
+  [ "$dir" != "$CLAUDE_HOME" ] || _die "the main profile uses Keychain — run 'claude /login' directly"
 
   _info ""
   _info "About to run 'claude setup-token' to generate a long-lived OAuth token for"
@@ -418,16 +513,18 @@ EOF
     fi
   }
 
-  if [ "$name" = "main" ] || [ "$name" = "default" ]; then
-    # Switching back to main: unset both vars so Keychain creds resume.
+  local dir token
+  dir="$(_profile_dir "$name")"
+
+  if [ "$dir" = "$CLAUDE_HOME" ]; then
+    # Switching to the main profile (regardless of label): unset both vars
+    # so Keychain creds resume.
     _maybe_warn_not_eval
     printf 'unset CLAUDE_CONFIG_DIR CLAUDE_CODE_OAUTH_TOKEN\n'
-    _info "cca: switched to main (Keychain auth)."
+    _info "cca: switched to $name (Keychain auth)."
     return
   fi
 
-  local dir token
-  dir="$(_profile_dir "$name")"
   [ -d "$dir" ] || _die "no such profile: $name (run: cca add $name)"
   token="$(_read_token "$dir")"
   [ -n "$token" ] || _die "no token saved for $name (run: cca login $name)"
@@ -623,68 +720,232 @@ cmd_init() {
   printf '  %sNew terminal windows pick it up automatically.%s\n' "$DIM" "$RESET" >&2
 }
 
-# Resolve a ccusage runner. Prefers a globally-installed `ccusage`, falls back
-# to `bunx`, then `npx`. Sets _CCUSAGE_CMD on success; returns 1 if nothing
-# usable is on PATH.
-_resolve_ccusage() {
-  if command -v ccusage >/dev/null 2>&1; then
-    _CCUSAGE_CMD="ccusage"
-  elif command -v bunx >/dev/null 2>&1; then
-    _CCUSAGE_CMD="bunx ccusage"
-  elif command -v npx >/dev/null 2>&1; then
-    _CCUSAGE_CMD="npx -y ccusage@latest"
-  else
-    return 1
-  fi
-}
-
 cmd_usage() {
-  if ! _resolve_ccusage; then
-    cat <<EOF >&2
-cca usage requires ccusage. Install one of:
-  - ccusage globally:  bun add -g ccusage   (or:  npm i -g ccusage)
-  - bun (provides bunx):  https://bun.sh
-  - node (provides npx):  https://nodejs.org
-
-See: https://github.com/ryoppippi/ccusage
-EOF
-    return 1
-  fi
-
-  local target="${1:-}"
-  # Anything after the target is passed through to ccusage (e.g. `cca usage personal daily`).
-  if [ -n "$target" ]; then
+  local show_all=0 target=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all|-a) show_all=1 ;;
+      '')       ;;
+      *)        target="$1" ;;
+    esac
     shift
-    _usage_one "$target" "$@"
-  else
+  done
+
+  if [ "$show_all" -eq 1 ]; then
     local dir name first=1
     while read -r dir; do
       [ -d "$dir" ] || continue
       name="$(_profile_name_of_dir "$dir")"
       [ "$first" -eq 1 ] || printf '\n'
       first=0
-      _usage_one "$name" "$@"
+      _usage_one "$name"
     done < <(_list_profile_dirs)
+    return
   fi
+
+  if [ -z "$target" ]; then
+    # Default: usage for the currently-active profile.
+    target="$(_profile_name_of_dir "$(_active_dir)")"
+  fi
+  _usage_one "$target"
 }
 
 _usage_one() {
   local name="$1"
-  shift
   local dir
   dir="$(_profile_dir "$name")"
   if [ ! -d "$dir" ]; then
     _warn "no such profile: $name"; return
   fi
 
-  printf '%s── %s%s%s ──%s\n' "$BOLD" "$CYAN" "$name" "$BOLD" "$RESET"
+  # Read all JSONL session transcripts in the profile and render a /stats-like
+  # heatmap + summary. No external deps — uses the Python that's already on
+  # PATH for the rest of cca.
+  /usr/bin/env python3 - "$dir" "$name" "${BOLD}" "${DIM}" "${CYAN}" "${GREEN}" "${ORANGE}" "${RESET}" <<'PY'
+import json, os, sys
+from collections import defaultdict, Counter
+from datetime import datetime, timedelta, date
 
-  # Ensure projects/ exists so ccusage doesn't error for never-used profiles.
-  [ -d "$dir/projects" ] || mkdir -p "$dir/projects"
+profile_dir = sys.argv[1]
+display     = sys.argv[2]
+BOLD, DIM, CYAN, GREEN, ORANGE, RESET = sys.argv[3:9]
 
-  # Run ccusage with CLAUDE_CONFIG_DIR pointed at this profile.
-  # Pass any extra args straight through (e.g. daily, monthly, --json).
-  CLAUDE_CONFIG_DIR="$dir" $_CCUSAGE_CMD "$@" || _warn "ccusage failed for $name"
+projects = os.path.join(profile_dir, "projects")
+if not os.path.isdir(projects):
+    print(f"  {BOLD}{CYAN}{display}{RESET}: no usage yet (no projects/ directory)")
+    sys.exit(0)
+
+day_tokens     = defaultdict(int)     # date -> total tokens
+day_sessions   = defaultdict(set)     # date -> set(session_id)
+model_tokens   = Counter()            # model -> tokens
+sessions       = {}                   # session_id -> (first_ts, last_ts, tokens)
+
+def ts(obj):
+    t = obj.get("timestamp")
+    if not t: return None
+    try: return datetime.fromisoformat(t.replace("Z", "+00:00"))
+    except Exception: return None
+
+for root, _, files in os.walk(projects):
+    for fname in files:
+        if not fname.endswith(".jsonl"): continue
+        sid = fname[:-6]
+        path = os.path.join(root, fname)
+        first = last = None
+        stoks = 0
+        try:
+            with open(path, errors="ignore") as fh:
+                for line in fh:
+                    try: obj = json.loads(line)
+                    except Exception: continue
+                    dt = ts(obj)
+                    if dt and (first is None or dt < first): first = dt
+                    if dt and (last  is None or dt > last):  last  = dt
+                    msg = obj.get("message") or {}
+                    if msg.get("role") != "assistant": continue
+                    usage = msg.get("usage") or {}
+                    n = (usage.get("input_tokens", 0) or 0) + \
+                        (usage.get("output_tokens", 0) or 0) + \
+                        (usage.get("cache_creation_input_tokens", 0) or 0) + \
+                        (usage.get("cache_read_input_tokens", 0) or 0)
+                    if n and dt:
+                        d = dt.date()
+                        day_tokens[d]   += n
+                        day_sessions[d].add(sid)
+                        stoks           += n
+                    model = msg.get("model")
+                    if model and n:
+                        model_tokens[model] += n
+        except Exception:
+            continue
+        if first and last:
+            sessions[sid] = (first, last, stoks)
+
+# ── heatmap ──
+today = date.today()
+start = today - timedelta(days=365)
+start = start - timedelta(days=(start.weekday() + 1) % 7)  # align to Sunday
+
+cols = []
+d = start
+while d <= today:
+    week = [day_tokens.get(d + timedelta(days=i), 0) for i in range(7)]
+    cols.append((d, week))
+    d += timedelta(days=7)
+
+nonzero = [v for v in day_tokens.values() if v > 0]
+peak = max(nonzero) if nonzero else 1
+def density(v):
+    if v == 0:
+        return f"{DIM}·{RESET}"
+    r = v / peak
+    if r < 0.2: ch = "░"
+    elif r < 0.4: ch = "▒"
+    elif r < 0.7: ch = "▓"
+    else: ch = "█"
+    return f"{ORANGE}{ch}{RESET}"
+
+# Month labels: 3-letter abbrev at the first col of each month, truncated
+# to fit if the month has fewer than 3 visible weeks (at heatmap edges).
+month_line = " " * 6
+i = 0
+while i < len(cols):
+    d_, _ = cols[i]
+    # Find where this month ends.
+    end = i
+    while end < len(cols) and cols[end][0].month == d_.month:
+        end += 1
+    weeks_in_month = end - i
+    label = d_.strftime("%b")[:weeks_in_month]
+    month_line += label + " " * (weeks_in_month - len(label))
+    i = end
+
+print()
+print(f"  {BOLD}{CYAN}{display}{RESET}")
+print()
+print(f"  {DIM}{month_line.rstrip()}{RESET}")
+
+day_names = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"]
+for i in range(7):
+    label = day_names[i] if i in (1, 3, 5) else "   "
+    row = f"  {DIM}{label:<4}{RESET}"
+    for _, week in cols:
+        row += density(week[i])
+    print(row)
+
+print()
+print(f"  {DIM}Less{RESET} {ORANGE}░ ▒ ▓ █{RESET} {DIM}More{RESET}")
+print()
+
+# ── summary ──
+def fmt(n):
+    if n >= 1_000_000_000: return f"{n/1_000_000_000:.1f}b"
+    if n >= 1_000_000:     return f"{n/1_000_000:.1f}m"
+    if n >= 1_000:         return f"{n/1_000:.1f}k"
+    return str(n)
+
+def dur(td):
+    d = td.days
+    h = td.seconds // 3600
+    m = (td.seconds % 3600) // 60
+    if d: return f"{d}d {h}h {m}m"
+    if h: return f"{h}h {m}m"
+    return f"{m}m"
+
+total = sum(day_tokens.values())
+unique_sessions = len({s for ss in day_sessions.values() for s in ss})
+active_days = sum(1 for v in day_tokens.values() if v > 0)
+window_days = (today - start).days + 1
+
+def pretty_model(name):
+    # "claude-opus-4-7"   → "Opus 4.7"
+    # "claude-sonnet-4-6" → "Sonnet 4.6"
+    # "claude-haiku-4-5"  → "Haiku 4.5"
+    import re
+    m = re.match(r"^claude-(opus|sonnet|haiku)-(\d+)-(\d+)", name)
+    if m:
+        return f"{m.group(1).capitalize()} {m.group(2)}.{m.group(3)}"
+    return name
+
+fav = pretty_model(model_tokens.most_common(1)[0][0]) if model_tokens else "—"
+longest = "—"
+# Only count sessions that actually produced tokens — bare-init files don't count.
+real_sessions = {sid: v for sid, v in sessions.items() if v[2] > 0}
+if real_sessions:
+    longest_td = max(e - s for s, e, _ in real_sessions.values())
+    longest = dur(longest_td) if longest_td.total_seconds() else "—"
+
+most_active = "—"
+if day_tokens:
+    md = max(day_tokens.items(), key=lambda x: x[1])[0]
+    most_active = md.strftime("%b %d")
+
+active_set = sorted(d for d, v in day_tokens.items() if v > 0)
+longest_streak = current_streak = 0
+if active_set:
+    run = 1
+    for i in range(1, len(active_set)):
+        if (active_set[i] - active_set[i-1]).days == 1: run += 1
+        else: longest_streak = max(longest_streak, run); run = 1
+    longest_streak = max(longest_streak, run)
+    check = today
+    while day_tokens.get(check, 0) > 0:
+        current_streak += 1
+        check -= timedelta(days=1)
+
+L = 38  # left column width
+def row(left_lbl, left_val, right_lbl, right_val):
+    left = f"  {DIM}{left_lbl}{RESET} {ORANGE}{left_val}{RESET}"
+    # account for ANSI codes when padding
+    pad = L - len(f"  {left_lbl} {left_val}")
+    if pad < 2: pad = 2
+    print(left + " " * pad + f"{DIM}{right_lbl}{RESET} {ORANGE}{right_val}{RESET}")
+
+row("Favorite model:", fav,                  "Total tokens:",    fmt(total))
+row("Sessions:",       str(unique_sessions), "Longest session:", longest)
+row("Active days:",    f"{active_days}/{window_days}", "Longest streak:", f"{longest_streak} days")
+row("Most active day:", most_active,         "Current streak:",  f"{current_streak} days")
+PY
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -716,6 +977,7 @@ main() {
     add|new)               cmd_add "$@" ;;
     refresh)               cmd_refresh "$@" ;;
     rm|remove|delete)      cmd_rm "$@" ;;
+    rename|mv)             cmd_rename "$@" ;;
     login)                 cmd_login "$@" ;;
     switch|sw)             cmd_switch "$@" ;;
     usage)                 cmd_usage "$@" ;;
