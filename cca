@@ -150,6 +150,52 @@ _read_token() {
 # commands
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Extract a short description (≤60 chars) from a file or directory.
+# type: command | agent | skill | rule | hook
+_extract_description() {
+  local type="$1" path="$2" desc=""
+
+  case "$type" in
+    command|agent)
+      if [ -f "$path" ]; then
+        desc=$(grep -m1 '^description:' "$path" 2>/dev/null \
+               | sed 's/^description:[[:space:]]*//' \
+               | tr -d '"'"'")
+        if [ -z "$desc" ]; then
+          desc=$(grep -v '^[[:space:]]*$' "$path" 2>/dev/null \
+                 | grep -v '^---' | grep -v '^#' \
+                 | head -1 | sed 's/^[[:space:]]*//')
+        fi
+      fi
+      ;;
+    skill)
+      local sf=""
+      [ -f "$path/SKILL.md" ] && sf="$path/SKILL.md"
+      if [ -z "$sf" ]; then
+        sf=$(find "$path" -maxdepth 1 -name "*.md" 2>/dev/null | sort | head -1)
+      fi
+      if [ -n "$sf" ]; then
+        desc=$(grep -m1 '^description:' "$sf" 2>/dev/null \
+               | sed 's/^description:[[:space:]]*//' \
+               | tr -d '"'"'")
+      fi
+      ;;
+    rule)
+      [ -f "$path" ] && desc=$(grep -vm1 '^[[:space:]]*$' "$path" 2>/dev/null \
+                               | head -1 | sed 's/^#[[:space:]]*//')
+      ;;
+    hook)
+      if [ -f "$path" ]; then
+        desc=$(grep -m1 '^#[^!]' "$path" 2>/dev/null | sed 's/^#[[:space:]]*//')
+      elif [ -d "$path" ]; then
+        desc="hook directory"
+      fi
+      ;;
+  esac
+
+  printf '%s' "${desc:0:60}"
+}
+
 _picker() {
   # Requires interactive TTY on stdin + stderr (UI goes to stderr so callers
   # can capture the selection via stdout).
