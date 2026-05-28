@@ -13,9 +13,9 @@ VERSION="0.1.1"
 CLAUDE_HOME="${HOME}/.claude"
 PROFILE_PREFIX="${HOME}/.claude-"
 
-# Items in ~/.claude/ shared across profiles (symlinked into each
-# ~/.claude-<name>/). Auth and per-session state are intentionally excluded.
-SHARED_ITEMS=(
+# Items in ~/.claude/ that can be copied into new profiles.
+# Auth and per-session state are intentionally excluded.
+COPYABLE_ITEMS=(
   CLAUDE.md
   agents
   commands
@@ -150,6 +150,309 @@ _read_token() {
 # commands
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Extract a short description (≤60 chars) from a file or directory.
+# type: command | agent | skill | rule | hook
+_extract_description() {
+  local type="$1" path="$2" desc=""
+
+  case "$type" in
+    command|agent)
+      if [ -f "$path" ]; then
+        desc=$(grep -m1 '^description:' "$path" 2>/dev/null \
+               | sed 's/^description:[[:space:]]*//' \
+               | tr -d '"'"'")
+        if [ -z "$desc" ]; then
+          desc=$(grep -v '^[[:space:]]*$' "$path" 2>/dev/null \
+                 | grep -v '^---' | grep -v '^#' \
+                 | head -1 | sed 's/^[[:space:]]*//')
+        fi
+      fi
+      ;;
+    skill)
+      local sf=""
+      [ -f "$path/SKILL.md" ] && sf="$path/SKILL.md"
+      if [ -z "$sf" ]; then
+        sf=$(find "$path" -maxdepth 1 -name "*.md" 2>/dev/null | sort | head -1)
+      fi
+      if [ -n "$sf" ]; then
+        desc=$(grep -m1 '^description:' "$sf" 2>/dev/null \
+               | sed 's/^description:[[:space:]]*//' \
+               | tr -d '"'"'")
+      fi
+      ;;
+    rule)
+      [ -f "$path" ] && desc=$(grep -vm1 '^[[:space:]]*$' "$path" 2>/dev/null \
+                               | head -1 | sed 's/^#[[:space:]]*//')
+      ;;
+    hook)
+      if [ -f "$path" ]; then
+        desc=$(grep -m1 '^#[^!]' "$path" 2>/dev/null | sed 's/^#[[:space:]]*//')
+      elif [ -d "$path" ]; then
+        desc="hook directory"
+      fi
+      ;;
+  esac
+
+  printf '%s' "${desc:0:60}"
+}
+
+# Interactive multi-select widget for one section of cca add/sync.
+# Usage: _multi_picker <title> <"name|description"> ...
+# Stdout: space-separated selected names (empty string if none selected)
+# Returns: 0=confirmed  1=skip section (esc/q)  2=abort entirely (Q)
+_multi_picker() {
+  local title="$1"
+  shift
+  local items=("$@")
+  local n=${#items[@]}
+
+  # Non-TTY or empty section: emit all names silently.
+  if [ ! -t 0 ] || [ ! -t 2 ] || [ "$n" -eq 0 ]; then
+    local item
+    for item in "${items[@]}"; do
+      printf '%s ' "${item%%|*}"
+    done
+    return 0
+  fi
+
+  local names=() descs=()
+  local item
+  for item in "${items[@]}"; do
+    names+=("${item%%|*}")
+    descs+=("${item#*|}")
+  done
+
+  # All items start selected.
+  local selected=()
+  local i
+  for ((i=0; i<n; i++)); do selected+=(1); done
+
+  local sel=0
+
+  # Column width: longest name + 2 spaces gap.
+  local max_name=4
+  for ((i=0; i<n; i++)); do
+    [ ${#names[$i]} -gt $max_name ] && max_name=${#names[$i]}
+  done
+
+  tput civis >&2 2>/dev/null || true
+  local _mpick_restored=0
+  _mpicker_cleanup() {
+    [ "$_mpick_restored" -eq 1 ] && return
+    _mpick_restored=1
+    tput cnorm >&2 2>/dev/null || true
+  }
+  trap _mpicker_cleanup EXIT INT TERM
+
+  # Reserve lines: title + n items + hint.
+  local total=$((n + 2))
+  for ((i=0; i<total; i++)); do printf '\n' >&2; done
+
+  local k r1 r2
+  while true; do
+    tput cuu "$total" >&2
+
+    tput el >&2
+    printf '  %s%s%s\n' "$BOLD" "$title" "$RESET" >&2
+
+    for ((i=0; i<n; i++)); do
+      tput el >&2
+      local chk pad spaces
+      if [ "${selected[$i]}" -eq 1 ]; then
+        chk="${GREEN}[✓]${RESET}"
+      else
+        chk="${DIM}[ ]${RESET}"
+      fi
+      pad=$(( max_name - ${#names[$i]} + 2 ))
+      spaces="$(printf '%*s' "$pad" '')"
+      if [ "$i" -eq "$sel" ]; then
+        printf '%s❯%s %s %s%s%s%s%s%s\n' \
+          "$ORANGE" "$RESET" "$chk" \
+          "$BOLD" "${names[$i]}" "$RESET" \
+          "$spaces" "${DIM}${descs[$i]}${RESET}" "$RESET" >&2
+      else
+        printf '  %s %s%s%s%s\n' \
+          "$chk" "${names[$i]}" \
+          "$spaces" "${DIM}${descs[$i]}${RESET}" "$RESET" >&2
+      fi
+    done
+
+    tput el >&2
+    printf '  %s↑/↓ move · space toggle · enter confirm · esc skip · Q quit%s\n' \
+      "$DIM" "$RESET" >&2
+
+    r1=''; r2=''
+    IFS= read -rsn1 k
+    case "$k" in
+      $'\033')
+        IFS= read -rsn1 -t 1 r1 2>/dev/null || r1=''
+        if [ "$r1" = "[" ]; then
+          IFS= read -rsn1 -t 1 r2 2>/dev/null || r2=''
+          case "$r2" in
+            A) sel=$(( (sel + n - 1) % n )) ;;
+            B) sel=$(( (sel + 1) % n )) ;;
+          esac
+        else
+          _mpicker_cleanup; trap - EXIT INT TERM; return 1
+        fi
+        ;;
+      ' ')
+        if [ "${selected[$sel]}" -eq 1 ]; then
+          selected[$sel]=0
+        else
+          selected[$sel]=1
+        fi
+        ;;
+      '')
+        _mpicker_cleanup; trap - EXIT INT TERM
+        local out=''
+        for ((i=0; i<n; i++)); do
+          [ "${selected[$i]}" -eq 1 ] && out="${out}${names[$i]} "
+        done
+        printf '%s' "${out% }"
+        return 0
+        ;;
+      q)
+        _mpicker_cleanup; trap - EXIT INT TERM; return 1
+        ;;
+      Q)
+        _mpicker_cleanup; trap - EXIT INT TERM; return 2
+        ;;
+    esac
+  done
+}
+
+# Emit "name|description" lines for a given section type.
+# Prints nothing when the section has no items available.
+# Types: config | commands | skills | rules | hooks | agents | plugins
+_collect_items_for_section() {
+  local type="$1"
+  local item desc
+  case "$type" in
+    config)
+      for item in settings.json CLAUDE.md mcp.json keybindings.json statusline.sh; do
+        [ -e "$CLAUDE_HOME/$item" ] || continue
+        case "$item" in
+          settings.json)    desc="Claude Code settings (theme, model, allowed tools)" ;;
+          CLAUDE.md)        desc="Project-level instructions for Claude" ;;
+          mcp.json)         desc="MCP server configurations" ;;
+          keybindings.json) desc="Custom keyboard shortcuts" ;;
+          statusline.sh)    desc="Custom status line script" ;;
+        esac
+        printf '%s|%s\n' "$item" "$desc"
+      done
+      ;;
+    commands)
+      [ -d "$CLAUDE_HOME/commands" ] || return 0
+      local f
+      for f in "$CLAUDE_HOME"/commands/*.md; do
+        [ -f "$f" ] || continue
+        item="$(basename "$f")"
+        desc="$(_extract_description command "$f")"
+        printf '%s|%s\n' "$item" "$desc"
+      done
+      ;;
+    skills)
+      [ -d "$CLAUDE_HOME/skills" ] || return 0
+      local d
+      for d in "$CLAUDE_HOME"/skills/*/; do
+        [ -d "$d" ] || continue
+        item="$(basename "$d")"
+        desc="$(_extract_description skill "$d")"
+        printf '%s|%s\n' "$item" "$desc"
+      done
+      ;;
+    rules)
+      [ -d "$CLAUDE_HOME/rules" ] || return 0
+      local f
+      for f in "$CLAUDE_HOME"/rules/*; do
+        [ -f "$f" ] || continue
+        item="$(basename "$f")"
+        desc="$(_extract_description rule "$f")"
+        printf '%s|%s\n' "$item" "$desc"
+      done
+      ;;
+    hooks)
+      [ -d "$CLAUDE_HOME/hooks" ] || return 0
+      local entry
+      for entry in "$CLAUDE_HOME"/hooks/*; do
+        [ -e "$entry" ] || continue
+        item="$(basename "$entry")"
+        desc="$(_extract_description hook "$entry")"
+        printf '%s|%s\n' "$item" "$desc"
+      done
+      ;;
+    agents)
+      [ -d "$CLAUDE_HOME/agents" ] || return 0
+      local f
+      for f in "$CLAUDE_HOME"/agents/*.md; do
+        [ -f "$f" ] || continue
+        item="$(basename "$f")"
+        desc="$(_extract_description agent "$f")"
+        printf '%s|%s\n' "$item" "$desc"
+      done
+      ;;
+    plugins)
+      [ -d "$CLAUDE_HOME/plugins" ] || return 0
+      printf 'plugins|Installed plugins and marketplace configuration\n'
+      ;;
+  esac
+}
+
+# Copy one item from ~/.claude/ into a profile directory.
+# force=1 uses cp -rf (overwrite); force=0 (default) uses cp without -f.
+# Plugins are copied selectively — ephemeral cache/data/repos dirs excluded.
+_copy_item() {
+  local type="$1" name="$2" dst_dir="$3" force="${4:-0}"
+  local src="$CLAUDE_HOME"
+
+  case "$type" in
+    config)
+      if [ "$force" -eq 1 ]; then cp -f  "$src/$name"          "$dst_dir/$name"
+      else                         cp     "$src/$name"          "$dst_dir/$name"; fi
+      ;;
+    commands)
+      mkdir -p "$dst_dir/commands"
+      if [ "$force" -eq 1 ]; then cp -f  "$src/commands/$name" "$dst_dir/commands/$name"
+      else                         cp     "$src/commands/$name" "$dst_dir/commands/$name"; fi
+      ;;
+    skills)
+      mkdir -p "$dst_dir/skills"
+      if [ "$force" -eq 1 ]; then cp -rf "$src/skills/$name"   "$dst_dir/skills/$name"
+      else                         cp -r  "$src/skills/$name"   "$dst_dir/skills/$name"; fi
+      ;;
+    rules)
+      mkdir -p "$dst_dir/rules"
+      if [ "$force" -eq 1 ]; then cp -f  "$src/rules/$name"    "$dst_dir/rules/$name"
+      else                         cp     "$src/rules/$name"    "$dst_dir/rules/$name"; fi
+      ;;
+    hooks)
+      mkdir -p "$dst_dir/hooks"
+      if [ "$force" -eq 1 ]; then cp -rf "$src/hooks/$name"    "$dst_dir/hooks/$name"
+      else                         cp -r  "$src/hooks/$name"    "$dst_dir/hooks/$name"; fi
+      ;;
+    agents)
+      mkdir -p "$dst_dir/agents"
+      if [ "$force" -eq 1 ]; then cp -f  "$src/agents/$name"   "$dst_dir/agents/$name"
+      else                         cp     "$src/agents/$name"   "$dst_dir/agents/$name"; fi
+      ;;
+    plugins)
+      mkdir -p "$dst_dir/plugins"
+      local pf
+      for pf in installed_plugins.json config.json known_marketplaces.json \
+                 blocklist.json plugin-catalog-cache.json; do
+        [ -f "$src/plugins/$pf" ] || continue
+        if [ "$force" -eq 1 ]; then cp -f  "$src/plugins/$pf" "$dst_dir/plugins/$pf"
+        else                         cp     "$src/plugins/$pf" "$dst_dir/plugins/$pf"; fi
+      done
+      if [ -d "$src/plugins/marketplaces" ]; then
+        if [ "$force" -eq 1 ]; then cp -rf "$src/plugins/marketplaces" "$dst_dir/plugins/"
+        else                         cp -r  "$src/plugins/marketplaces" "$dst_dir/plugins/"; fi
+      fi
+      ;;
+  esac
+}
+
 _picker() {
   # Requires interactive TTY on stdin + stderr (UI goes to stderr so callers
   # can capture the selection via stdout).
@@ -268,10 +571,9 @@ cmd_help() {
   cat <<EOF
 ${B}${C}cca${R} ${D}— Claude Code Accounts (${VERSION})${R}
 
-Run multiple Claude Code (CLI) subscriptions side by side. Each profile has
-its own long-lived OAuth token and config dir. Shared customisation
-(settings, hooks, agents, skills, plugins, commands) is symlinked from your
-main ${C}~/.claude/${R}, so changes in one place apply to all profiles.
+Run multiple Claude Code (CLI) subscriptions side by side. Each profile is
+fully independent — copy exactly what you need at creation time, or add
+more later with ${C}cca sync${R}.
 
 ${D}Scope: Claude Code CLI only — Claude Desktop / Cowork is not managed by cca.${R}
 
@@ -279,12 +581,12 @@ ${B}Usage:${R}
   ${C}cca${R}                       interactive picker — choose a profile to switch to
   ${C}cca ls${R}                    list profiles, mark active, show auth state
   ${C}cca active${R}                print active profile name
-  ${C}cca add${R} <name>            create profile <name> (mkdir + symlink shared)
+  ${C}cca add${R} <name>            create profile <name> (interactive item picker)
   ${C}cca login${R} <name>          run \`claude setup-token\` and save token for <name>
   ${C}cca switch${R} <name>         switch the active profile in this shell
   ${C}cca rename${R} <old> <new>    rename profile (also: ${C}cca mv${R})
   ${C}cca rm${R} <name>             delete profile <name>
-  ${C}cca refresh${R} <name>        re-create symlinks for an existing profile
+  ${C}cca sync${R} <name>           copy items from ~/.claude/ into a profile
   ${C}cca usage${R} [name]          heatmap + summary for one profile
                               ${D}(defaults to the active profile)${R}
   ${C}cca usage${R} --all           same, for every profile
@@ -351,33 +653,112 @@ cmd_add() {
   # Pre-create projects/ so tools like ccusage don't error before the
   # profile has any sessions yet.
   mkdir -p "$dir/projects"
-  local item src
-  for item in "${SHARED_ITEMS[@]}"; do
-    src="$CLAUDE_HOME/$item"
-    if [ -e "$src" ]; then
-      ln -s "$src" "$dir/$item"
+
+  local sections=(
+    "config:Config Files"
+    "commands:Commands"
+    "skills:Skills"
+    "rules:Rules"
+    "hooks:Hooks"
+    "agents:Agents"
+    "plugins:Plugins"
+  )
+  local total_copied=0
+  local section_def type title items_raw selected name_sel rc
+
+  for section_def in "${sections[@]}"; do
+    type="${section_def%%:*}"
+    title="${section_def#*:}"
+
+    items_raw=()
+    while IFS= read -r line; do
+      [ -n "$line" ] && items_raw+=("$line")
+    done < <(_collect_items_for_section "$type")
+    [ ${#items_raw[@]} -eq 0 ] && continue
+
+    selected="$(_multi_picker "$title" "${items_raw[@]}")"
+    rc=$?
+
+    if [ "$rc" -eq 2 ]; then
+      rm -rf "$dir"
+      _info "cca: add aborted — no profile created."
+      return 1
+    fi
+    [ "$rc" -eq 1 ] && continue
+
+    if [ -n "$selected" ]; then
+      for name_sel in $selected; do
+        _copy_item "$type" "$name_sel" "$dir" 0
+        total_copied=$((total_copied + 1))
+      done
     fi
   done
+
   printf 'Created profile %s at %s\n' "$name" "$dir"
+  if [ "$total_copied" -eq 0 ]; then
+    printf '%s(no items copied — run: cca sync %s)%s\n' "$DIM" "$name" "$RESET"
+  fi
   printf 'Next: cca login %s\n' "$name"
+}
+
+cmd_sync() {
+  local name="${1:-}"
+  [ -n "$name" ] || _die "usage: cca sync <name>"
+  local dir
+  dir="$(_profile_dir "$name")"
+  [ -d "$dir" ] || _die "no such profile: $name (run: cca add $name)"
+
+  local sections=(
+    "config:Config Files"
+    "commands:Commands"
+    "skills:Skills"
+    "rules:Rules"
+    "hooks:Hooks"
+    "agents:Agents"
+    "plugins:Plugins"
+  )
+  local total_copied=0
+  local section_def type title items_raw selected name_sel rc
+
+  for section_def in "${sections[@]}"; do
+    type="${section_def%%:*}"
+    title="${section_def#*:}"
+
+    items_raw=()
+    while IFS= read -r line; do
+      [ -n "$line" ] && items_raw+=("$line")
+    done < <(_collect_items_for_section "$type")
+    [ ${#items_raw[@]} -eq 0 ] && continue
+
+    selected="$(_multi_picker "$title" "${items_raw[@]}")"
+    rc=$?
+
+    if [ "$rc" -eq 2 ]; then
+      _info "cca: sync cancelled — no changes made."
+      return 1
+    fi
+    [ "$rc" -eq 1 ] && continue
+
+    if [ -n "$selected" ]; then
+      for name_sel in $selected; do
+        _copy_item "$type" "$name_sel" "$dir" 1
+        total_copied=$((total_copied + 1))
+      done
+    fi
+  done
+
+  if [ "$total_copied" -eq 0 ]; then
+    printf 'cca: nothing synced.\n'
+  else
+    printf 'Synced %d item(s) to profile %s\n' "$total_copied" "$name"
+  fi
 }
 
 cmd_refresh() {
   local name="${1:-}"
-  [ -n "$name" ] || _die "usage: cca refresh <name>"
-  local dir
-  dir="$(_profile_dir "$name")"
-  [ -d "$dir" ] || _die "no such profile: $name"
-  local item src target
-  for item in "${SHARED_ITEMS[@]}"; do
-    src="$CLAUDE_HOME/$item"
-    target="$dir/$item"
-    [ -L "$target" ] && rm "$target"
-    if [ -e "$src" ] && [ ! -e "$target" ]; then
-      ln -s "$src" "$target"
-    fi
-  done
-  printf 'Refreshed symlinks for %s\n' "$name"
+  [ -n "$name" ] || _die "usage: cca sync <name>  (refresh has been renamed to sync)"
+  _warn "'refresh' is now 'sync'. Running: cca sync $name"
+  cmd_sync "$name"
 }
 
 cmd_rename() {
@@ -441,7 +822,7 @@ cmd_rm() {
   [ "$dir" != "$CLAUDE_HOME" ] || _die "cannot remove the main profile (it lives at $CLAUDE_HOME)"
   printf 'About to delete profile dir: %s\n' "$dir"
   printf 'This removes the stored token and per-profile state.\n'
-  printf 'Shared items are symlinks; originals in ~/.claude/ are untouched.\n'
+  printf 'Copied items inside the profile dir will also be removed.\n'
   printf 'Type the profile name to confirm: '
   local reply
   read -r reply
@@ -985,6 +1366,7 @@ main() {
     ls|list)               cmd_ls "$@" ;;
     active|current)        cmd_active "$@" ;;
     add|new)               cmd_add "$@" ;;
+    sync)                  cmd_sync "$@" ;;
     refresh)               cmd_refresh "$@" ;;
     rm|remove|delete)      cmd_rm "$@" ;;
     rename|mv)             cmd_rename "$@" ;;
