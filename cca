@@ -653,14 +653,51 @@ cmd_add() {
   # Pre-create projects/ so tools like ccusage don't error before the
   # profile has any sessions yet.
   mkdir -p "$dir/projects"
-  local item src
-  for item in "${COPYABLE_ITEMS[@]}"; do
-    src="$CLAUDE_HOME/$item"
-    if [ -e "$src" ]; then
-      ln -s "$src" "$dir/$item"
+
+  local sections=(
+    "config:Config Files"
+    "commands:Commands"
+    "skills:Skills"
+    "rules:Rules"
+    "hooks:Hooks"
+    "agents:Agents"
+    "plugins:Plugins"
+  )
+  local total_copied=0
+  local section_def type title items_raw selected name_sel rc
+
+  for section_def in "${sections[@]}"; do
+    type="${section_def%%:*}"
+    title="${section_def#*:}"
+
+    items_raw=()
+    while IFS= read -r line; do
+      [ -n "$line" ] && items_raw+=("$line")
+    done < <(_collect_items_for_section "$type")
+    [ ${#items_raw[@]} -eq 0 ] && continue
+
+    selected="$(_multi_picker "$title" "${items_raw[@]}")"
+    rc=$?
+
+    if [ "$rc" -eq 2 ]; then
+      rm -rf "$dir"
+      _info "cca: add aborted — no profile created."
+      return 1
+    fi
+    [ "$rc" -eq 1 ] && continue
+
+    if [ -n "$selected" ]; then
+      for name_sel in $selected; do
+        _copy_item "$type" "$name_sel" "$dir" 0
+        total_copied=$((total_copied + 1))
+      done
     fi
   done
+
   printf 'Created profile %s at %s\n' "$name" "$dir"
+  if [ "$total_copied" -eq 0 ]; then
+    printf '%s(no items copied — run: cca sync %s)%s\n' "$DIM" "$name" "$RESET"
+  fi
   printf 'Next: cca login %s\n' "$name"
 }
 
@@ -741,7 +778,7 @@ cmd_rm() {
   [ "$dir" != "$CLAUDE_HOME" ] || _die "cannot remove the main profile (it lives at $CLAUDE_HOME)"
   printf 'About to delete profile dir: %s\n' "$dir"
   printf 'This removes the stored token and per-profile state.\n'
-  printf 'Shared items are symlinks; originals in ~/.claude/ are untouched.\n'
+  printf 'Copied items inside the profile dir will also be removed.\n'
   printf 'Type the profile name to confirm: '
   local reply
   read -r reply
