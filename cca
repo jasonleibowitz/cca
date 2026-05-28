@@ -322,6 +322,137 @@ _multi_picker() {
   done
 }
 
+# Emit "name|description" lines for a given section type.
+# Prints nothing when the section has no items available.
+# Types: config | commands | skills | rules | hooks | agents | plugins
+_collect_items_for_section() {
+  local type="$1"
+  local item desc
+  case "$type" in
+    config)
+      for item in settings.json CLAUDE.md mcp.json keybindings.json statusline.sh; do
+        [ -e "$CLAUDE_HOME/$item" ] || continue
+        case "$item" in
+          settings.json)    desc="Claude Code settings (theme, model, allowed tools)" ;;
+          CLAUDE.md)        desc="Project-level instructions for Claude" ;;
+          mcp.json)         desc="MCP server configurations" ;;
+          keybindings.json) desc="Custom keyboard shortcuts" ;;
+          statusline.sh)    desc="Custom status line script" ;;
+        esac
+        printf '%s|%s\n' "$item" "$desc"
+      done
+      ;;
+    commands)
+      [ -d "$CLAUDE_HOME/commands" ] || return 0
+      local f
+      for f in "$CLAUDE_HOME"/commands/*.md; do
+        [ -f "$f" ] || continue
+        item="$(basename "$f")"
+        desc="$(_extract_description command "$f")"
+        printf '%s|%s\n' "$item" "$desc"
+      done
+      ;;
+    skills)
+      [ -d "$CLAUDE_HOME/skills" ] || return 0
+      local d
+      for d in "$CLAUDE_HOME"/skills/*/; do
+        [ -d "$d" ] || continue
+        item="$(basename "$d")"
+        desc="$(_extract_description skill "$d")"
+        printf '%s|%s\n' "$item" "$desc"
+      done
+      ;;
+    rules)
+      [ -d "$CLAUDE_HOME/rules" ] || return 0
+      local f
+      for f in "$CLAUDE_HOME"/rules/*; do
+        [ -f "$f" ] || continue
+        item="$(basename "$f")"
+        desc="$(_extract_description rule "$f")"
+        printf '%s|%s\n' "$item" "$desc"
+      done
+      ;;
+    hooks)
+      [ -d "$CLAUDE_HOME/hooks" ] || return 0
+      local entry
+      for entry in "$CLAUDE_HOME"/hooks/*; do
+        [ -e "$entry" ] || continue
+        item="$(basename "$entry")"
+        desc="$(_extract_description hook "$entry")"
+        printf '%s|%s\n' "$item" "$desc"
+      done
+      ;;
+    agents)
+      [ -d "$CLAUDE_HOME/agents" ] || return 0
+      local f
+      for f in "$CLAUDE_HOME"/agents/*.md; do
+        [ -f "$f" ] || continue
+        item="$(basename "$f")"
+        desc="$(_extract_description agent "$f")"
+        printf '%s|%s\n' "$item" "$desc"
+      done
+      ;;
+    plugins)
+      [ -d "$CLAUDE_HOME/plugins" ] || return 0
+      printf 'plugins|Installed plugins and marketplace configuration\n'
+      ;;
+  esac
+}
+
+# Copy one item from ~/.claude/ into a profile directory.
+# force=1 uses cp -rf (overwrite); force=0 (default) uses cp without -f.
+# Plugins are copied selectively — ephemeral cache/data/repos dirs excluded.
+_copy_item() {
+  local type="$1" name="$2" dst_dir="$3" force="${4:-0}"
+  local src="$CLAUDE_HOME"
+
+  case "$type" in
+    config)
+      if [ "$force" -eq 1 ]; then cp -f  "$src/$name"          "$dst_dir/$name"
+      else                         cp     "$src/$name"          "$dst_dir/$name"; fi
+      ;;
+    commands)
+      mkdir -p "$dst_dir/commands"
+      if [ "$force" -eq 1 ]; then cp -f  "$src/commands/$name" "$dst_dir/commands/$name"
+      else                         cp     "$src/commands/$name" "$dst_dir/commands/$name"; fi
+      ;;
+    skills)
+      mkdir -p "$dst_dir/skills"
+      if [ "$force" -eq 1 ]; then cp -rf "$src/skills/$name"   "$dst_dir/skills/$name"
+      else                         cp -r  "$src/skills/$name"   "$dst_dir/skills/$name"; fi
+      ;;
+    rules)
+      mkdir -p "$dst_dir/rules"
+      if [ "$force" -eq 1 ]; then cp -f  "$src/rules/$name"    "$dst_dir/rules/$name"
+      else                         cp     "$src/rules/$name"    "$dst_dir/rules/$name"; fi
+      ;;
+    hooks)
+      mkdir -p "$dst_dir/hooks"
+      if [ "$force" -eq 1 ]; then cp -rf "$src/hooks/$name"    "$dst_dir/hooks/$name"
+      else                         cp -r  "$src/hooks/$name"    "$dst_dir/hooks/$name"; fi
+      ;;
+    agents)
+      mkdir -p "$dst_dir/agents"
+      if [ "$force" -eq 1 ]; then cp -f  "$src/agents/$name"   "$dst_dir/agents/$name"
+      else                         cp     "$src/agents/$name"   "$dst_dir/agents/$name"; fi
+      ;;
+    plugins)
+      mkdir -p "$dst_dir/plugins"
+      local pf
+      for pf in installed_plugins.json config.json known_marketplaces.json \
+                 blocklist.json plugin-catalog-cache.json; do
+        [ -f "$src/plugins/$pf" ] || continue
+        if [ "$force" -eq 1 ]; then cp -f  "$src/plugins/$pf" "$dst_dir/plugins/$pf"
+        else                         cp     "$src/plugins/$pf" "$dst_dir/plugins/$pf"; fi
+      done
+      if [ -d "$src/plugins/marketplaces" ]; then
+        if [ "$force" -eq 1 ]; then cp -rf "$src/plugins/marketplaces" "$dst_dir/plugins/"
+        else                         cp -r  "$src/plugins/marketplaces" "$dst_dir/plugins/"; fi
+      fi
+      ;;
+  esac
+}
+
 _picker() {
   # Requires interactive TTY on stdin + stderr (UI goes to stderr so callers
   # can capture the selection via stdout).
