@@ -13,9 +13,9 @@ VERSION="0.1.0"
 CLAUDE_HOME="${HOME}/.claude"
 PROFILE_PREFIX="${HOME}/.claude-"
 
-# Items in ~/.claude/ shared across profiles (symlinked into each
-# ~/.claude-<name>/). Auth and per-session state are intentionally excluded.
-SHARED_ITEMS=(
+# Items in ~/.claude/ that can be copied into new profiles.
+# Auth and per-session state are intentionally excluded.
+COPYABLE_ITEMS=(
   CLAUDE.md
   agents
   commands
@@ -268,10 +268,9 @@ cmd_help() {
   cat <<EOF
 ${B}${C}cca${R} ${D}— Claude Code Accounts (${VERSION})${R}
 
-Run multiple Claude Code (CLI) subscriptions side by side. Each profile has
-its own long-lived OAuth token and config dir. Shared customisation
-(settings, hooks, agents, skills, plugins, commands) is symlinked from your
-main ${C}~/.claude/${R}, so changes in one place apply to all profiles.
+Run multiple Claude Code (CLI) subscriptions side by side. Each profile is
+fully independent — copy exactly what you need at creation time, or add
+more later with ${C}cca sync${R}.
 
 ${D}Scope: Claude Code CLI only — Claude Desktop / Cowork is not managed by cca.${R}
 
@@ -279,12 +278,12 @@ ${B}Usage:${R}
   ${C}cca${R}                       interactive picker — choose a profile to switch to
   ${C}cca ls${R}                    list profiles, mark active, show auth state
   ${C}cca active${R}                print active profile name
-  ${C}cca add${R} <name>            create profile <name> (mkdir + symlink shared)
+  ${C}cca add${R} <name>            create profile <name> (interactive item picker)
   ${C}cca login${R} <name>          run \`claude setup-token\` and save token for <name>
   ${C}cca switch${R} <name>         switch the active profile in this shell
   ${C}cca rename${R} <old> <new>    rename profile (also: ${C}cca mv${R})
   ${C}cca rm${R} <name>             delete profile <name>
-  ${C}cca refresh${R} <name>        re-create symlinks for an existing profile
+  ${C}cca sync${R} <name>           copy items from ~/.claude/ into a profile
   ${C}cca usage${R} [name]          heatmap + summary for one profile
                               ${D}(defaults to the active profile)${R}
   ${C}cca usage${R} --all           same, for every profile
@@ -352,7 +351,7 @@ cmd_add() {
   # profile has any sessions yet.
   mkdir -p "$dir/projects"
   local item src
-  for item in "${SHARED_ITEMS[@]}"; do
+  for item in "${COPYABLE_ITEMS[@]}"; do
     src="$CLAUDE_HOME/$item"
     if [ -e "$src" ]; then
       ln -s "$src" "$dir/$item"
@@ -362,22 +361,20 @@ cmd_add() {
   printf 'Next: cca login %s\n' "$name"
 }
 
-cmd_refresh() {
+cmd_sync() {
   local name="${1:-}"
-  [ -n "$name" ] || _die "usage: cca refresh <name>"
+  [ -n "$name" ] || _die "usage: cca sync <name>"
   local dir
   dir="$(_profile_dir "$name")"
-  [ -d "$dir" ] || _die "no such profile: $name"
-  local item src target
-  for item in "${SHARED_ITEMS[@]}"; do
-    src="$CLAUDE_HOME/$item"
-    target="$dir/$item"
-    [ -L "$target" ] && rm "$target"
-    if [ -e "$src" ] && [ ! -e "$target" ]; then
-      ln -s "$src" "$target"
-    fi
-  done
-  printf 'Refreshed symlinks for %s\n' "$name"
+  [ -d "$dir" ] || _die "no such profile: $name (run: cca add $name)"
+  _info "cca sync: not yet implemented — coming in next task"
+}
+
+cmd_refresh() {
+  local name="${1:-}"
+  [ -n "$name" ] || _die "usage: cca sync <name>  (refresh has been renamed to sync)"
+  _warn "'refresh' is now 'sync'. Running: cca sync $name"
+  cmd_sync "$name"
 }
 
 cmd_rename() {
@@ -985,6 +982,7 @@ main() {
     ls|list)               cmd_ls "$@" ;;
     active|current)        cmd_active "$@" ;;
     add|new)               cmd_add "$@" ;;
+    sync)                  cmd_sync "$@" ;;
     refresh)               cmd_refresh "$@" ;;
     rm|remove|delete)      cmd_rm "$@" ;;
     rename|mv)             cmd_rename "$@" ;;
