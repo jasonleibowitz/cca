@@ -707,7 +707,51 @@ cmd_sync() {
   local dir
   dir="$(_profile_dir "$name")"
   [ -d "$dir" ] || _die "no such profile: $name (run: cca add $name)"
-  _info "cca sync: not yet implemented — coming in next task"
+
+  local sections=(
+    "config:Config Files"
+    "commands:Commands"
+    "skills:Skills"
+    "rules:Rules"
+    "hooks:Hooks"
+    "agents:Agents"
+    "plugins:Plugins"
+  )
+  local total_copied=0
+  local section_def type title items_raw selected name_sel rc
+
+  for section_def in "${sections[@]}"; do
+    type="${section_def%%:*}"
+    title="${section_def#*:}"
+
+    items_raw=()
+    while IFS= read -r line; do
+      [ -n "$line" ] && items_raw+=("$line")
+    done < <(_collect_items_for_section "$type")
+    [ ${#items_raw[@]} -eq 0 ] && continue
+
+    selected="$(_multi_picker "$title" "${items_raw[@]}")"
+    rc=$?
+
+    if [ "$rc" -eq 2 ]; then
+      _info "cca: sync cancelled — no changes made."
+      return 1
+    fi
+    [ "$rc" -eq 1 ] && continue
+
+    if [ -n "$selected" ]; then
+      for name_sel in $selected; do
+        _copy_item "$type" "$name_sel" "$dir" 1
+        total_copied=$((total_copied + 1))
+      done
+    fi
+  done
+
+  if [ "$total_copied" -eq 0 ]; then
+    printf 'cca: nothing synced.\n'
+  else
+    printf 'Synced %d item(s) to profile %s\n' "$total_copied" "$name"
+  fi
 }
 
 cmd_refresh() {
