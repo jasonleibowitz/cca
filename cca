@@ -196,6 +196,132 @@ _extract_description() {
   printf '%s' "${desc:0:60}"
 }
 
+# Interactive multi-select widget for one section of cca add/sync.
+# Usage: _multi_picker <title> <"name|description"> ...
+# Stdout: space-separated selected names (empty string if none selected)
+# Returns: 0=confirmed  1=skip section (esc/q)  2=abort entirely (Q)
+_multi_picker() {
+  local title="$1"
+  shift
+  local items=("$@")
+  local n=${#items[@]}
+
+  # Non-TTY or empty section: emit all names silently.
+  if [ ! -t 0 ] || [ ! -t 2 ] || [ "$n" -eq 0 ]; then
+    local item
+    for item in "${items[@]}"; do
+      printf '%s ' "${item%%|*}"
+    done
+    return 0
+  fi
+
+  local names=() descs=()
+  local item
+  for item in "${items[@]}"; do
+    names+=("${item%%|*}")
+    descs+=("${item#*|}")
+  done
+
+  # All items start selected.
+  local selected=()
+  local i
+  for ((i=0; i<n; i++)); do selected+=(1); done
+
+  local sel=0
+
+  # Column width: longest name + 2 spaces gap.
+  local max_name=4
+  for ((i=0; i<n; i++)); do
+    [ ${#names[$i]} -gt $max_name ] && max_name=${#names[$i]}
+  done
+
+  tput civis >&2 2>/dev/null || true
+  local _mpick_restored=0
+  _mpicker_cleanup() {
+    [ "$_mpick_restored" -eq 1 ] && return
+    _mpick_restored=1
+    tput cnorm >&2 2>/dev/null || true
+  }
+  trap _mpicker_cleanup EXIT INT TERM
+
+  # Reserve lines: title + n items + hint.
+  local total=$((n + 2))
+  for ((i=0; i<total; i++)); do printf '\n' >&2; done
+
+  local k r1 r2
+  while true; do
+    tput cuu "$total" >&2
+
+    tput el >&2
+    printf '  %s%s%s\n' "$BOLD" "$title" "$RESET" >&2
+
+    for ((i=0; i<n; i++)); do
+      tput el >&2
+      local chk pad spaces
+      if [ "${selected[$i]}" -eq 1 ]; then
+        chk="${GREEN}[✓]${RESET}"
+      else
+        chk="${DIM}[ ]${RESET}"
+      fi
+      pad=$(( max_name - ${#names[$i]} + 2 ))
+      spaces="$(printf '%*s' "$pad" '')"
+      if [ "$i" -eq "$sel" ]; then
+        printf '%s❯%s %s %s%s%s%s%s%s\n' \
+          "$ORANGE" "$RESET" "$chk" \
+          "$BOLD" "${names[$i]}" "$RESET" \
+          "$spaces" "${DIM}${descs[$i]}${RESET}" "$RESET" >&2
+      else
+        printf '  %s %s%s%s%s\n' \
+          "$chk" "${names[$i]}" \
+          "$spaces" "${DIM}${descs[$i]}${RESET}" "$RESET" >&2
+      fi
+    done
+
+    tput el >&2
+    printf '  %s↑/↓ move · space toggle · enter confirm · esc skip · Q quit%s\n' \
+      "$DIM" "$RESET" >&2
+
+    r1=''; r2=''
+    IFS= read -rsn1 k
+    case "$k" in
+      $'\033')
+        IFS= read -rsn1 -t 1 r1 2>/dev/null || r1=''
+        if [ "$r1" = "[" ]; then
+          IFS= read -rsn1 -t 1 r2 2>/dev/null || r2=''
+          case "$r2" in
+            A) sel=$(( (sel + n - 1) % n )) ;;
+            B) sel=$(( (sel + 1) % n )) ;;
+          esac
+        else
+          _mpicker_cleanup; trap - EXIT INT TERM; return 1
+        fi
+        ;;
+      ' ')
+        if [ "${selected[$sel]}" -eq 1 ]; then
+          selected[$sel]=0
+        else
+          selected[$sel]=1
+        fi
+        ;;
+      '')
+        _mpicker_cleanup; trap - EXIT INT TERM
+        local out=''
+        for ((i=0; i<n; i++)); do
+          [ "${selected[$i]}" -eq 1 ] && out="${out}${names[$i]} "
+        done
+        printf '%s' "${out% }"
+        return 0
+        ;;
+      q)
+        _mpicker_cleanup; trap - EXIT INT TERM; return 1
+        ;;
+      Q)
+        _mpicker_cleanup; trap - EXIT INT TERM; return 2
+        ;;
+    esac
+  done
+}
+
 _picker() {
   # Requires interactive TTY on stdin + stderr (UI goes to stderr so callers
   # can capture the selection via stdout).
